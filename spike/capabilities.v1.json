@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "first_runtime": {
+    "decision": "NO-GO",
+    "harness": null,
+    "reason": "No live lane had complete prerequisite approval. No exact tuple was selected or exercised; there is no actual-auth evidence for any required case.",
+    "next_action": "Nominate one exact subscription tuple and approve its auth method and terms, provider, permitted synthetic inputs and egress, and hard usage bounds. Confirm a real confinement boundary and descendant supervisor before running that lane. Keep R01 unready until approved requalification yields a GO, or the owner approves a revised plan."
+  },
+  "harnesses": {
+    "omp": {
+      "decision": "refusal",
+      "evidence_class": "none",
+      "reason": "Unavailable prerequisite: nominated by name only; exact tuple and lane-specific auth, terms, provider/data/egress and usage approval were not supplied. Neither per-run attachment nor filtered fallback was evaluated.",
+      "version": null,
+      "platform": null,
+      "auth_mode": null,
+      "channel": null,
+      "approval": null,
+      "model": null,
+      "usage": null,
+      "cases": {}
+    },
+    "claude-code": {
+      "decision": "refusal",
+      "evidence_class": "none",
+      "reason": "Unavailable prerequisite: nominated by name only; exact tuple and lane-specific auth, terms, provider/data/egress and usage approval were not supplied. Neither per-run attachment nor filtered fallback was evaluated.",
+      "version": null,
+      "platform": null,
+      "auth_mode": null,
+      "channel": null,
+      "approval": null,
+      "model": null,
+      "usage": null,
+      "cases": {}
+    },
+    "codex": {
+      "decision": "refusal",
+      "evidence_class": "none",
+      "reason": "Unavailable prerequisite: nominated by name only; exact tuple and lane-specific auth, terms, provider/data/egress and usage approval were not supplied. Neither per-run attachment nor filtered fallback was evaluated.",
+      "version": null,
+      "platform": null,
+      "auth_mode": null,
+      "channel": null,
+      "approval": null,
+      "model": null,
+      "usage": null,
+      "cases": {}
+    },
+    "agy": {
+      "decision": "refusal",
+      "evidence_class": "none",
+      "reason": "Unavailable prerequisite: nominated by name only; exact tuple and lane-specific auth, terms, provider/data/egress and usage approval were not supplied. Neither per-run attachment nor filtered fallback was evaluated.",
+      "version": null,
+      "platform": null,
+      "auth_mode": null,
+      "channel": null,
+      "approval": null,
+      "model": null,
+      "usage": null,
+      "cases": {}
+    }
+  }
+}
