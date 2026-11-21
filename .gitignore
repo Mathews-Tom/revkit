@@ -1,0 +1,14 @@
+/target/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.claude/
+CLAUDE.md
+!/.docs/
+/.docs/*
+!/.docs/DEVELOPMENT_PLAN.md
+!/.docs/EXECUTION_PROMPTS.md
