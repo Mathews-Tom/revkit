@@ -1,0 +1,14 @@
+version = 1
+
+[scope]
+deny = []
+exclude = []
+include = []
+generated = []
+
+[tiers]
+high = []
+low = []
+
+# Commands run only with review --trusted-local --run-checks.
+[checks]
