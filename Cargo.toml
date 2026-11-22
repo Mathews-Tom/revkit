@@ -5,6 +5,8 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Pre-push review of committed changes"
 repository = "https://github.com/Mathews-Tom/revkit"
+readme = "README.md"
+include = ["/Cargo.lock", "/Cargo.toml", "/LICENSE", "/README.md", "/CHANGELOG.md", "/src/**", "/tests/**"]
 
 [workspace]
 resolver = "3"

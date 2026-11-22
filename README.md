@@ -1,13 +1,13 @@
 # revkit
 
-Rust CLI for pre-push review of committed changes. This is an unreleased development build.
+Rust CLI for pre-push review of committed changes. The initial supported target is Apple Silicon macOS.
 
 ## Quickstart
 
-Build from source with Git and a current stable Rust toolchain. Review requires Unix process supervision and an already-configured `omp`; `plan` does not require `omp` or make a model call.
+Install the published 0.1.0 crate with Git and a current stable Rust toolchain, or build from a source checkout with `cargo install --locked --path /path/to/revkit`. Review requires an already-configured `omp`; `plan` does not require `omp` or make a model call.
 
 ```sh
-cargo install --locked --path /path/to/revkit
+cargo install --locked revkit --version 0.1.0
 revkit init
 revkit doctor
 ```
@@ -52,5 +52,7 @@ Use `--format json` for versioned structured output, or `--format sarif` with `r
 | `6` | Reviewer unavailable |
 
 Reports show all applicable reasons. Incomplete or unavailable review takes precedence over check and finding exit codes; failing checks take precedence over findings. Tests use a scripted reviewer and need no provider account.
+
+Maintainers: see [release instructions](https://github.com/Mathews-Tom/revkit/blob/main/docs/releasing.md).
 
 - [Apache-2.0 license](LICENSE)
