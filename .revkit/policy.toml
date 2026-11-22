@@ -1,0 +1,2 @@
+# Denied paths are never supplied to reviewers or checks.
+deny = []
