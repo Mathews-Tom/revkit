@@ -40,11 +40,11 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 ## Results
 
-`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. The default text review report shows the token counters OMP returned, or `not reported` if none are available. These counters do not establish billed usage or subscription quota consumption.
+`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. In the unreleased source build, the default text review report shows the token counters OMP returned, or `not reported` if none are available. These counters do not establish billed usage or subscription quota consumption.
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
-Run `revkit findings --run ID` in text mode to see the saved head, per-file coverage, and reasons alongside anchored findings. This is a lookup; it does not run the model or checks and can succeed even when the saved review was incomplete.
+Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. The published 0.1.0 and 0.1.1 builds list anchored findings but do not show these details in text mode. This lookup does not run the model or checks and can succeed even when the saved review was incomplete.
 
 | Exit | Meaning |
 |---|---|
