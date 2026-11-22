@@ -40,6 +40,8 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 ## Results
 
+`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. The default text review report shows the token counters OMP returned, or `not reported` if none are available. These counters do not establish billed usage or subscription quota consumption.
+
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
 | Exit | Meaning |

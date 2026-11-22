@@ -391,11 +391,15 @@ fn text_plan(out: &mut dyn Write, plan: &Plan) -> io::Result<()> {
     for reason in &plan.admission.reasons {
         writeln!(out, "  {reason}")?;
     }
-    writeln!(
-        out,
-        "Prompt estimate: {:?} bytes; changed lines: {:?}",
-        plan.admission.prompt_bytes, plan.admission.changed_lines
-    )?;
+    if let (Some(bytes), Some(lines)) = (plan.admission.prompt_bytes, plan.admission.changed_lines)
+    {
+        writeln!(
+            out,
+            "Review request: {bytes} bytes, {lines} changed lines (before harness context; not a token budget)"
+        )?;
+    } else {
+        writeln!(out, "Review request size: not computed")?;
+    }
     writeln!(
         out,
         "Effective rules: {} ({} bytes)",
@@ -453,6 +457,15 @@ fn show_report(out: &mut impl Write, format: Format, report: &Report) -> Result<
             "Trust: trusted-local; no confinement. Head: {}",
             report.comparison.head
         )?;
+        write!(out, "Harness token counters (not billing or quota):")?;
+        if let Some(usage) = report.usage.as_ref().and_then(|usage| usage.as_object()) {
+            for (name, count) in usage {
+                write!(out, " {name}={count}")?;
+            }
+        } else {
+            write!(out, " not reported")?;
+        }
+        writeln!(out)?;
         for (path, status) in &report.coverage {
             writeln!(out, "  {path:?}: {status}")?;
         }

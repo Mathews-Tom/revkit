@@ -59,6 +59,10 @@ impl Repo {
     }
 
     fn cli(&self, code: i32, args: &[&str]) -> Value {
+        serde_json::from_slice(&self.cli_stdout(code, args)).unwrap()
+    }
+
+    fn cli_stdout(&self, code: i32, args: &[&str]) -> Vec<u8> {
         let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
             .args(args)
             .current_dir(self.root())
@@ -71,7 +75,7 @@ impl Repo {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice(&output.stdout).unwrap()
+        output.stdout
     }
 
     fn runner(&self, name: &str, script: &str) -> PathBuf {
@@ -232,6 +236,45 @@ fn setup_plan_and_rule_provenance_use_only_pinned_git_inputs() {
     );
     assert_eq!(doctor["ready"], true);
     assert_eq!(doctor["profile_checked"], false);
+}
+
+#[test]
+fn text_output_distinguishes_request_size_from_harness_usage() {
+    let repo = Repo::new();
+    repo.write("display.py", "label = 'old'\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("display.py", "label = 'new'\n");
+    repo.checkpoint("change");
+
+    let plan = String::from_utf8(repo.cli_stdout(0, &["plan", "--base", "main"])).unwrap();
+    assert!(plan.contains("bytes, 2 changed lines (before harness context; not a token budget)"));
+
+    let stub = repo.stub(verdicts(&[clean("display.py")]), true);
+    let missing = repo.root().join("missing-reviewer");
+    for (harness, exit, tokens) in [
+        (stub, 0, "input=420 output=25"),
+        (missing, 6, "not reported"),
+    ] {
+        let report = repo.cli_stdout(
+            exit,
+            &[
+                "review",
+                "--base",
+                "main",
+                "--trusted-local",
+                "--harness",
+                harness.to_str().unwrap(),
+                "--model",
+                "fixture/model",
+            ],
+        );
+        let report = String::from_utf8(report).unwrap();
+        assert!(
+            report.lines().any(|line| line.ends_with(tokens)),
+            "{report}"
+        );
+    }
 }
 
 #[test]
