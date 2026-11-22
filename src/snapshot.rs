@@ -421,6 +421,8 @@ impl Git {
                 let patch = self.bytes(&[
                     "-c",
                     "diff.algorithm=myers",
+                    "-c",
+                    "diff.suppressBlankEmpty=false",
                     "diff",
                     "--no-color",
                     "--no-ext-diff",

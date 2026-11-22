@@ -575,16 +575,20 @@ fn rename_preserves_source_and_destination_policy() {
 #[test]
 fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
     let repo = Repo::new();
-    repo.write("file.txt", "unchanged\nremoved\ntrailing\n");
+    repo.git(&["config", "diff.suppressBlankEmpty", "true"]);
+    repo.write("file.txt", "leading\n\nunchanged\nremoved\ntrailing\n");
     repo.checkpoint("base");
     repo.git(&["checkout", "-qb", "change"]);
     let long_line = "x".repeat(4_097);
-    repo.write("file.txt", &format!("unchanged\n{long_line}\ntrailing\n"));
+    repo.write(
+        "file.txt",
+        &format!("leading\n\nunchanged\n{long_line}\ntrailing\n"),
+    );
     repo.checkpoint("head");
 
-    let mut combined = finding("file.txt", "head", 2, &long_line);
+    let mut combined = finding("file.txt", "head", 4, &long_line);
     let entries = combined["findings"].as_array_mut().unwrap();
-    entries.push(finding("file.txt", "base", 2, "removed")["findings"][0].clone());
+    entries.push(finding("file.txt", "base", 4, "removed")["findings"][0].clone());
     let report = repo.review(2, &repo.stub(verdicts(&[combined]), true), &[]);
     assert_eq!(report["findings"].as_array().unwrap().len(), 2);
     assert!(
@@ -594,7 +598,7 @@ fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
             .iter()
             .any(|row| row["excerpt"] == long_line)
     );
-    let invalid = finding("file.txt", "base", 1, "unchanged");
+    let invalid = finding("file.txt", "base", 3, "unchanged");
     let report = repo.review(3, &repo.stub(verdicts(&[invalid]), true), &[]);
     assert_eq!(report["findings"], json!([]));
     assert_eq!(report["leads"][0]["reason"], "invalid_anchor");
