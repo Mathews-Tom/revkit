@@ -52,5 +52,3 @@ Use `--format json` for versioned structured output, or `--format sarif` with `r
 | `6` | Reviewer unavailable |
 
 Reports show all applicable reasons. Incomplete or unavailable review takes precedence over check and finding exit codes; failing checks take precedence over findings. Tests use a scripted reviewer and need no provider account.
-
-- [Apache-2.0 license](LICENSE)
