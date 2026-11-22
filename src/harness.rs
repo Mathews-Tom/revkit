@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,17 +46,49 @@ pub(crate) fn run(
     }
 }
 
+pub(crate) fn available_executable(executable: &Path) -> Option<PathBuf> {
+    fn runnable(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|meta| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                meta.is_file() && meta.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                meta.is_file()
+            }
+        })
+    }
+    let cwd = std::env::current_dir().ok()?;
+    if executable.is_absolute() || executable.as_os_str().as_encoded_bytes().contains(&b'/') {
+        let path = cwd.join(executable);
+        return runnable(&path).then_some(path);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| cwd.join(dir).join(executable))
+        .find(|path| runnable(path))
+}
+
 pub(crate) fn bounded(
     command: &mut std::process::Command,
     timeout: Duration,
 ) -> Result<std::process::Output, &'static str> {
+    bounded_with_cap(command, timeout, 1024 * 1024)
+}
+
+pub(crate) fn bounded_with_cap(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<std::process::Output, &'static str> {
     #[cfg(unix)]
     {
-        unix::bounded(command, timeout)
+        unix::bounded(command, timeout, max_bytes)
     }
     #[cfg(not(unix))]
     {
-        let _ = (command, timeout);
+        let _ = (command, timeout, max_bytes);
         Err("Process-group supervision is unavailable on this platform.")
     }
 }
@@ -104,8 +136,13 @@ impl Transcript {
                 transcript.terminal = false;
                 continue;
             };
-            // Completion belongs to the final event, not to an earlier agent_end
-            // that yielded while another asynchronous task was still running.
+            // These explicit advisor-only notifications cannot resume primary work.
+            // Confirmed in OMP's AgentSessionEvent and RPC wire event definitions.
+            if matches!(kind, "advisor_yielded" | "advisor_cost_changed") {
+                continue;
+            }
+            // Primary and unknown events invalidate earlier completion until a
+            // subsequent terminal agent_end proves the primary run finished.
             transcript.terminal = false;
             match kind {
                 "message_end" | "turn_end" => {
@@ -281,18 +318,11 @@ mod unix {
         prompt: &str,
         timeout: Duration,
     ) -> Execution {
+        let Some(executable) = super::available_executable(executable) else {
+            return Execution::unavailable("Could not resolve the OMP executable path.");
+        };
         let Ok(scratch) = tempfile::tempdir() else {
             return Execution::unavailable("Could not create an isolated OMP working directory.");
-        };
-        // Bare names retain OS PATH resolution. Relative paths containing a
-        // separator must be anchored before switching to the scratch directory.
-        let executable = if executable.is_relative() && executable.components().count() > 1 {
-            let Ok(cwd) = std::env::current_dir() else {
-                return Execution::unavailable("Could not resolve the OMP executable path.");
-            };
-            cwd.join(executable)
-        } else {
-            executable.to_owned()
         };
         let mut command = Command::new(executable);
         command.args([
@@ -317,7 +347,7 @@ mod unix {
             .arg(prompt)
             .current_dir(scratch.path())
             .env("PWD", scratch.path());
-        match supervise(&mut command, timeout) {
+        match supervise(&mut command, timeout, OUTPUT_CAP) {
             Ok(capture) => Transcript::parse(&capture.stdout).finish(
                 capture.status.is_some_and(|status| status.success()),
                 capture.failure,
@@ -329,8 +359,9 @@ mod unix {
     pub(super) fn bounded(
         command: &mut Command,
         timeout: Duration,
+        max_bytes: usize,
     ) -> Result<Output, &'static str> {
-        let capture = supervise(command, timeout)?;
+        let capture = supervise(command, timeout, max_bytes)?;
         if let Some(reason) = capture.failure {
             return Err(reason);
         }
@@ -375,7 +406,11 @@ mod unix {
         Ok(())
     }
 
-    fn supervise(command: &mut Command, timeout: Duration) -> Result<Capture, &'static str> {
+    fn supervise(
+        command: &mut Command,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<Capture, &'static str> {
         if interrupted() {
             return Ok(Capture {
                 status: None,
@@ -432,7 +467,7 @@ mod unix {
                 }
             }
             if stdout_open {
-                match drain(&mut stdout, Some(&mut bytes), &mut total) {
+                match drain(&mut stdout, Some(&mut bytes), &mut total, max_bytes) {
                     Ok(open) => stdout_open = open,
                     Err(reason) => {
                         failure = Some(reason);
@@ -441,7 +476,7 @@ mod unix {
                 }
             }
             if stderr_open {
-                match drain(&mut stderr, Some(&mut diagnostics), &mut total) {
+                match drain(&mut stderr, Some(&mut diagnostics), &mut total, max_bytes) {
                     Ok(open) => stderr_open = open,
                     Err(reason) => {
                         failure = Some(reason);
@@ -477,8 +512,8 @@ mod unix {
             terminate(&mut child);
             // Preserve immediately available text without ever blocking on an
             // inherited descriptor. A full output budget must not grow further.
-            if total < OUTPUT_CAP {
-                let _ = drain(&mut stdout, Some(&mut bytes), &mut total);
+            if total < max_bytes {
+                let _ = drain(&mut stdout, Some(&mut bytes), &mut total, max_bytes);
             }
         }
         Ok(Capture {
@@ -502,20 +537,23 @@ mod unix {
         reader: &mut impl Read,
         mut capture: Option<&mut Vec<u8>>,
         total: &mut usize,
+        max_bytes: usize,
     ) -> Result<bool, &'static str> {
         let mut buffer = [0_u8; 8192];
         loop {
             // Read one extra byte to distinguish exactly-at-cap output from overflow.
-            let limit = buffer.len().min(OUTPUT_CAP.saturating_sub(*total) + 1);
+            let limit = buffer
+                .len()
+                .min(max_bytes.saturating_sub(*total).saturating_add(1));
             match reader.read(&mut buffer[..limit]) {
                 Ok(0) => return Ok(false),
                 Ok(count) => {
-                    let kept = count.min(OUTPUT_CAP.saturating_sub(*total));
+                    let kept = count.min(max_bytes.saturating_sub(*total));
                     if let Some(capture) = capture.as_deref_mut() {
                         capture.extend_from_slice(&buffer[..kept]);
                     }
-                    *total += count;
-                    if *total > OUTPUT_CAP {
+                    *total += kept;
+                    if count > kept {
                         return Err("Process exceeded the combined output limit.");
                     }
                 }
@@ -540,5 +578,70 @@ mod unix {
         kill_group(child);
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Status, Transcript};
+
+    const COMPLETE: &str = concat!(
+        "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stopReason\":\"stop\"}}\n",
+        "{\"type\":\"agent_end\"}\n",
+    );
+
+    #[test]
+    fn advisor_tail_preserves_primary_completion() {
+        let events = format!(
+            "{COMPLETE}{{\"type\":\"advisor_cost_changed\"}}\n{{\"type\":\"advisor_yielded\"}}\n"
+        );
+        assert_eq!(
+            Transcript::parse(events.as_bytes())
+                .finish(true, None)
+                .status,
+            Status::Complete
+        );
+    }
+
+    #[test]
+    fn primary_and_unknown_tails_require_another_terminal_event() {
+        for kind in [
+            "agent_start",
+            "message_start",
+            "agent_pause",
+            "advisor_unknown",
+            "unknown",
+        ] {
+            let events =
+                format!("{COMPLETE}{{\"type\":\"{kind}\"}}\n{{\"type\":\"advisor_yielded\"}}\n");
+            assert_eq!(
+                Transcript::parse(events.as_bytes())
+                    .finish(true, None)
+                    .status,
+                Status::Incomplete
+            );
+            let events = format!("{events}{{\"type\":\"agent_end\"}}\n");
+            assert_eq!(
+                Transcript::parse(events.as_bytes())
+                    .finish(true, None)
+                    .status,
+                Status::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn advisor_tail_does_not_complete_a_yielded_primary() {
+        let events = format!(
+            "{COMPLETE}{{\"type\":\"agent_end\",\"isTerminal\":false}}\n\
+             {{\"type\":\"advisor_cost_changed\"}}\n{{\"type\":\"advisor_yielded\"}}\n"
+        );
+        assert_eq!(
+            Transcript::parse(events.as_bytes())
+                .finish(true, None)
+                .status,
+            Status::Incomplete
+        );
     }
 }

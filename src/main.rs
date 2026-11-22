@@ -9,7 +9,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -143,7 +143,13 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
         return Err("SARIF is available for review and findings only".into());
     }
     if let Command::Review { runtime, .. } | Command::Doctor { runtime, .. } = &mut cli.command {
-        if runtime.harness.is_relative() && runtime.harness.components().count() > 1 {
+        if runtime.harness.is_relative()
+            && runtime
+                .harness
+                .as_os_str()
+                .as_encoded_bytes()
+                .contains(&b'/')
+        {
             runtime.harness = env::current_dir()?.join(&runtime.harness);
         }
         if runtime
@@ -327,7 +333,7 @@ fn doctor(
 ) -> Result<u8> {
     let pinned = base.map(|rev| git.resolve_commit(rev)).transpose()?;
     let policy = plan::policy_at(git, pinned.as_deref())?;
-    let executable = available_executable(&runtime.harness);
+    let executable = harness::available_executable(&runtime.harness);
     let ready = cfg!(unix) && executable.is_some();
     emit(
         out,
@@ -361,28 +367,6 @@ fn doctor(
         },
     )?;
     Ok(if ready { 0 } else { 6 })
-}
-
-fn available_executable(executable: &Path) -> Option<PathBuf> {
-    fn runnable(path: &Path) -> bool {
-        fs::metadata(path).is_ok_and(|meta| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                meta.is_file() && meta.permissions().mode() & 0o111 != 0
-            }
-            #[cfg(not(unix))]
-            {
-                meta.is_file()
-            }
-        })
-    }
-    if executable.is_absolute() || executable.components().count() != 1 {
-        return runnable(executable).then(|| executable.to_owned());
-    }
-    env::split_paths(&env::var_os("PATH")?)
-        .map(|dir| dir.join(executable))
-        .find(|path| runnable(path))
 }
 
 fn text_plan(out: &mut dyn Write, plan: &Plan) -> io::Result<()> {

@@ -144,8 +144,6 @@ struct ScopedRule {
     rule: Rule,
     paths: GlobSet,
     replaces: Vec<String>,
-    // Resolved once at load time, including transitive replacement targets.
-    supersedes: BTreeSet<usize>,
 }
 
 pub(crate) struct Policy {
@@ -304,9 +302,11 @@ impl Policy {
         matching
             .iter()
             .filter_map(|&index| {
-                (!matching
-                    .iter()
-                    .any(|&other| self.rules[other].supersedes.contains(&index)))
+                (!matching.iter().any(|&other| {
+                    self.rules[other]
+                        .replaces
+                        .contains(&self.rules[index].rule.id)
+                }))
                 .then_some(&self.rules[index].rule)
             })
             .collect()
@@ -394,7 +394,6 @@ fn scoped_rule(
         rule: Rule { id, source, body },
         paths: compile(&paths)?,
         replaces,
-        supersedes: BTreeSet::new(),
     })
 }
 
@@ -604,7 +603,6 @@ fn resolve_replacements(rules: &mut [ScopedRule]) -> Result<()> {
             edges[index].push(target_index);
         }
     }
-    let mut resolved = Vec::with_capacity(rules.len());
     for index in 0..rules.len() {
         let mut seen = BTreeSet::new();
         let mut pending = edges[index].clone();
@@ -616,10 +614,6 @@ fn resolve_replacements(rules: &mut [ScopedRule]) -> Result<()> {
                 pending.extend(edges[target].iter().copied());
             }
         }
-        resolved.push(seen);
-    }
-    for (rule, supersedes) in rules.iter_mut().zip(resolved) {
-        rule.supersedes = supersedes;
     }
     Ok(())
 }
@@ -644,12 +638,13 @@ fn manual_rules(agents: &str) -> Option<&str> {
                 } else if count >= 3 {
                     fence = Some((marker, count));
                 }
-            } else if fence.is_none() {
-                let heading = content.trim_end();
-                if start.is_none() && heading == "## Code Review Rules" {
+            } else if fence.is_none()
+                && let Some((level, title)) = atx_heading(content)
+            {
+                if start.is_none() && level == 2 && title == "Code Review Rules" {
                     start = Some(offset + line.len());
                 } else if let Some(start) = start
-                    && (heading.starts_with("# ") || heading.starts_with("## "))
+                    && level <= 2
                 {
                     let body = agents[start..offset].trim();
                     return (!body.is_empty()).then_some(body);
@@ -662,4 +657,114 @@ fn manual_rules(agents: &str) -> Option<&str> {
         let body = agents[start..].trim();
         (!body.is_empty()).then_some(body)
     })
+}
+
+fn atx_heading(content: &str) -> Option<(usize, &str)> {
+    let level = content.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &content[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let title = rest.trim_matches([' ', '\t']);
+    let without_hashes = title.trim_end_matches('#');
+    let title = if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
+        without_hashes.trim_end_matches([' ', '\t'])
+    } else {
+        title
+    };
+    Some((level, title))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_does_not_cross_an_out_of_scope_intermediate() {
+        let rules = [
+            ("base", "**", None),
+            ("middle", "docs/**", Some("base")),
+            ("last", "src/**", Some("middle")),
+        ]
+        .into_iter()
+        .map(|(id, paths, replaces)| {
+            let replacement =
+                replaces.map_or(String::new(), |target| format!("replaces: {target}\n"));
+            (
+                format!(".revkit/rules/{id}.md"),
+                format!("---\nid: {id}\npaths: \"{paths}\"\n{replacement}---\nReview {id}."),
+            )
+        })
+        .collect();
+        let policy = Policy::load(None, None, rules, None).unwrap();
+        let ids: Vec<_> = policy
+            .rules_for("src/file.txt")
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect();
+        assert_eq!(ids, ["base", "last"]);
+        let ids: Vec<_> = policy
+            .rules_for("docs/file.txt")
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect();
+        assert_eq!(ids, ["middle"]);
+    }
+
+    #[test]
+    fn trusted_heading_ignores_fenced_titles_and_stops_at_next_section() {
+        let agents = "```md\n## Code Review Rules\nFake rules.\n```\n  ##\tCode Review Rules\t###\t\nTrusted rules.\n### Details\nKeep these.\n~~~md\n## Fake end\n~~~\n##\tFollowing section\t##\nNot rules.\n";
+        let policy = Policy::load(None, None, Vec::new(), Some(agents)).unwrap();
+        let rules = policy.rules_for("file.txt");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "agents.code_review");
+        assert_eq!(
+            rules[0].body,
+            "Trusted rules.\n### Details\nKeep these.\n~~~md\n## Fake end\n~~~"
+        );
+    }
+
+    #[test]
+    fn replacement_validation_remains_global() {
+        for definitions in [
+            vec![("a", "b"), ("b", "a")],
+            vec![("a", "missing")],
+            vec![("a", "builtin.rust"), ("b", "builtin.rust")],
+        ] {
+            let rules = definitions
+                .into_iter()
+                .enumerate()
+                .map(|(index, (id, target))| {
+                    (
+                        format!(".revkit/rules/{id}.md"),
+                        format!("---\nid: {id}\npaths: \"scope{index}/**\"\nreplaces: {target}\n---\nReview this."),
+                    )
+                })
+                .collect();
+            assert!(Policy::load(None, None, rules, None).is_err());
+        }
+    }
+
+    #[test]
+    fn atx_heading_recognizes_levels_and_optional_closing_hashes() {
+        assert_eq!(
+            atx_heading("## Code Review Rules ##"),
+            Some((2, "Code Review Rules"))
+        );
+        assert_eq!(
+            atx_heading("##\tCode Review Rules\t"),
+            Some((2, "Code Review Rules"))
+        );
+        assert_eq!(
+            atx_heading("## Code Review Rules##"),
+            Some((2, "Code Review Rules##"))
+        );
+        assert_eq!(atx_heading("##"), Some((2, "")));
+        assert_eq!(atx_heading("#\tNext"), Some((1, "Next")));
+        assert_eq!(atx_heading("##Not a heading"), None);
+        assert_eq!(atx_heading("####### Too deep"), None);
+    }
 }

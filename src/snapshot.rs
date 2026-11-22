@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -68,16 +69,8 @@ impl Git {
     }
 
     fn limited(&self, args: &[&str], limit: u64) -> Result<Vec<u8>> {
-        let mut child = Command::new("git")
-            .args([
-                "--no-replace-objects",
-                "--no-lazy-fetch",
-                "--no-optional-locks",
-                "--literal-pathspecs",
-            ])
-            .args(args)
-            .current_dir(&self.cwd)
-            .env("GIT_ATTR_NOSYSTEM", "1")
+        let mut child = self
+            .command(args)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
@@ -101,6 +94,49 @@ impl Git {
             return Err(format!("git {} failed ({status})", args[0]).into());
         }
         Ok(bytes)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        // Do not let the caller redirect repository discovery, object lookup,
+        // configuration, or pathspec interpretation.
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(inherited_git_override) {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args([
+                "--no-replace-objects",
+                "--no-optional-locks",
+                "--literal-pathspecs",
+            ])
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            // Older Git ignores GIT_NO_LAZY_FETCH. Deny every transport as
+            // well, so a missing promisor object cannot trigger a fetch.
+            .env("GIT_ALLOW_PROTOCOL", "");
+        command
+    }
+
+    #[cfg(unix)]
+    fn limited_until(&self, args: &[&str], limit: u64, deadline: Instant) -> Result<Vec<u8>> {
+        let mut command = self.command(args);
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or("Exact check snapshot exceeded its deadline")?;
+        let output =
+            crate::harness::bounded_with_cap(&mut command, timeout, usize::try_from(limit)?)?;
+        if Instant::now() >= deadline || crate::harness::interrupted() {
+            return Err("Exact check snapshot interrupted or exceeded its deadline".into());
+        }
+        if !output.status.success() {
+            return Err(format!("git {} failed ({})", args[0], output.status).into());
+        }
+        Ok(output.stdout)
     }
 
     fn text(&self, args: &[&str]) -> Result<String> {
@@ -206,7 +242,7 @@ impl Git {
             return Err("Comparison exceeds the path inventory limit".into());
         }
         let mut records = raw.split(|&b| b == 0);
-        let mut files = Vec::new();
+        let mut deltas = Vec::new();
         let mut remaining = MAX_CLASSIFICATION_BYTES;
         while let Some(header) = records.next() {
             let delta = Delta::parse(str::from_utf8(header)?)?;
@@ -216,56 +252,96 @@ impl Git {
             } else {
                 (None, first)
             };
-            let old_path = old.map(str::from_utf8).transpose();
-            let (path, path_bytes_hex, scope) = match (str::from_utf8(path), old_path) {
-                (Ok(path), Ok(old)) => {
-                    let sides = [Some(path), old];
-                    if sides.iter().flatten().any(|path| secret_path(path)) {
-                        (None, None, excluded("secret_path"))
-                    } else if sides.iter().flatten().any(|path| policy.protected(path)) {
-                        (None, None, excluded("denied_path"))
-                    } else if let Some(reason) = old.and_then(|old| policy.scope(old)) {
-                        (Some(path.to_owned()), None, excluded(reason))
-                    } else {
-                        (
-                            Some(path.to_owned()),
-                            None,
-                            self.scope(&delta, path, policy, &mut remaining)?,
-                        )
-                    }
-                }
-                _ if old.is_some() => (None, None, excluded("unsupported_path_encoding")),
-                _ => {
-                    let display = String::from_utf8_lossy(path);
-                    if secret_path(&display) || policy.protected(&display) {
-                        (None, None, excluded("denied_path"))
-                    } else {
-                        let mut hex = String::with_capacity(path.len() * 2);
-                        for byte in path {
-                            write!(hex, "{byte:02x}")?;
-                        }
-                        (None, Some(hex), excluded("unsupported_path_encoding"))
-                    }
-                }
-            };
-            let disclosable = !matches!(scope, Selection::Excluded { .. });
-            files.push(File {
-                path,
-                old_path: if disclosable {
-                    old_path?.map(str::to_owned)
-                } else {
-                    None
-                },
-                path_bytes_hex,
-                change: delta.change,
-                scope,
-                old_mode: delta.sides[0].0.to_owned(),
-                new_mode: delta.sides[1].0.to_owned(),
-                old_blob: if disclosable { delta.blob(0) } else { None },
-                new_blob: if disclosable { delta.blob(1) } else { None },
-            });
+            deltas.push((delta, old, path, None));
         }
-        Ok(files)
+        // Classify deletions before any unmatched addition. Rename detection
+        // is heuristic: a protected source may otherwise reappear as an add.
+        let mut ambiguous = false;
+        for (delta, old, path, file) in &mut deltas {
+            if delta.change == "deleted" {
+                let deleted = self.file(delta, *old, path, policy, &mut remaining, false)?;
+                ambiguous |= matches!(
+                    deleted.scope,
+                    Selection::Excluded {
+                        reason: "secret_path"
+                            | "denied_path"
+                            | "unsupported_path_encoding"
+                            | "unsupported_path"
+                    }
+                );
+                *file = Some(deleted);
+            }
+        }
+        deltas
+            .into_iter()
+            .map(|(delta, old, path, file)| match file {
+                Some(file) => Ok(file),
+                None => self.file(&delta, old, path, policy, &mut remaining, ambiguous),
+            })
+            .collect()
+    }
+
+    fn file(
+        &self,
+        delta: &Delta<'_>,
+        old: Option<&[u8]>,
+        path: &[u8],
+        policy: &crate::policy::Policy,
+        remaining: &mut u64,
+        ambiguous: bool,
+    ) -> Result<File> {
+        let old_path = old.map(str::from_utf8).transpose();
+        let (path, path_bytes_hex, scope) = match (str::from_utf8(path), old_path) {
+            (Ok(path), Ok(old)) => {
+                let sides = [Some(path), old];
+                if sides.iter().flatten().any(|path| secret_path(path)) {
+                    (None, None, excluded("secret_path"))
+                } else if sides.iter().flatten().any(|path| policy.protected(path)) {
+                    (None, None, excluded("denied_path"))
+                } else if ambiguous && delta.change == "added" {
+                    (None, None, excluded("ambiguous_protected_rename"))
+                } else if let Some(reason) = old.and_then(|old| policy.scope(old)) {
+                    (Some(path.to_owned()), None, excluded(reason))
+                } else {
+                    (
+                        Some(path.to_owned()),
+                        None,
+                        self.scope(delta, path, policy, remaining)?,
+                    )
+                }
+            }
+            _ if old.is_some() => (None, None, excluded("unsupported_path_encoding")),
+            _ => {
+                let display = String::from_utf8_lossy(path);
+                if secret_path(&display) || policy.protected(&display) {
+                    (None, None, excluded("denied_path"))
+                } else if ambiguous && delta.change == "added" {
+                    (None, None, excluded("ambiguous_protected_rename"))
+                } else {
+                    let mut hex = String::with_capacity(path.len() * 2);
+                    for byte in path {
+                        write!(hex, "{byte:02x}")?;
+                    }
+                    (None, Some(hex), excluded("unsupported_path_encoding"))
+                }
+            }
+        };
+        let disclosable = !matches!(scope, Selection::Excluded { .. });
+        Ok(File {
+            path,
+            old_path: if disclosable {
+                old_path?.map(str::to_owned)
+            } else {
+                None
+            },
+            path_bytes_hex,
+            change: delta.change,
+            scope,
+            old_mode: delta.sides[0].0.to_owned(),
+            new_mode: delta.sides[1].0.to_owned(),
+            old_blob: if disclosable { delta.blob(0) } else { None },
+            new_blob: if disclosable { delta.blob(1) } else { None },
+        })
     }
 
     fn scope(
@@ -469,16 +545,33 @@ impl Git {
         head: &str,
         root: &Path,
         policy: &crate::policy::Policy,
+        deadline: Instant,
     ) -> Result<()> {
-        use std::fs::{self, OpenOptions};
+        use std::fs::OpenOptions;
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
 
         const MAX_TREE: u64 = 32 * 1024 * 1024;
-        let entries = self.tree(head, None)?;
-        if entries.len() > 2_000 {
+        if !valid_oid(head) {
+            return Err("Invalid tree commit".into());
+        }
+        let bytes = self.limited_until(
+            &["ls-tree", "-r", "-z", "--full-tree", head, "--"],
+            4 * MAX_BLOB_BYTES,
+            deadline,
+        )?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let records = bytes
+            .strip_suffix(b"\0")
+            .ok_or("Unterminated Git tree")?
+            .split(|byte| *byte == 0);
+        if records.clone().count() > 2_000 {
             return Err("Exact check snapshot exceeds the file limit".into());
         }
+        let entries = records.map(TreeEntry::parse).collect::<Result<Vec<_>>>()?;
+        let mut directories = std::collections::BTreeSet::new();
         let mut remaining = MAX_TREE;
         for entry in entries {
             let path = str::from_utf8(&entry.path)?;
@@ -487,19 +580,78 @@ impl Git {
                     "Exact check snapshot contains a protected or unsupported entry".into(),
                 );
             }
-            let bytes = self.limited(&["cat-file", "blob", &entry.oid], remaining)?;
+            let bytes =
+                self.limited_until(&["cat-file", "blob", &entry.oid], remaining, deadline)?;
             remaining -= bytes.len() as u64;
+            create_snapshot_parents(root, Path::new(path), &mut directories)?;
             let path = root.join(path);
-            fs::create_dir_all(path.parent().ok_or("Missing check snapshot parent")?)?;
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(if entry.mode == "100755" { 0o755 } else { 0o644 })
                 .open(path)?
                 .write_all(&bytes)?;
+            if Instant::now() >= deadline || crate::harness::interrupted() {
+                return Err("Exact check snapshot interrupted or exceeded its deadline".into());
+            }
         }
         Ok(())
     }
+}
+
+fn inherited_git_override(name: &str) -> bool {
+    name.starts_with("GIT_CONFIG")
+        || matches!(
+            name,
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                | "GIT_OBJECT_DIRECTORY"
+                | "GIT_DIR"
+                | "GIT_WORK_TREE"
+                | "GIT_IMPLICIT_WORK_TREE"
+                | "GIT_GRAFT_FILE"
+                | "GIT_INDEX_FILE"
+                | "GIT_NO_REPLACE_OBJECTS"
+                | "GIT_REPLACE_REF_BASE"
+                | "GIT_PREFIX"
+                | "GIT_SHALLOW_FILE"
+                | "GIT_COMMON_DIR"
+                | "GIT_CEILING_DIRECTORIES"
+                | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+                | "GIT_INTERNAL_SUPER_PREFIX"
+                | "GIT_LITERAL_PATHSPECS"
+                | "GIT_GLOB_PATHSPECS"
+                | "GIT_NOGLOB_PATHSPECS"
+                | "GIT_ICASE_PATHSPECS"
+                | "GIT_DIFF_OPTS"
+        )
+}
+
+#[cfg(unix)]
+fn create_snapshot_parents(
+    root: &Path,
+    path: &Path,
+    directories: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut relative = PathBuf::new();
+    for component in path
+        .parent()
+        .ok_or("Missing check snapshot parent")?
+        .components()
+    {
+        relative.push(component);
+        if directories.contains(&relative) {
+            continue;
+        }
+        match std::fs::create_dir(root.join(&relative)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err("Exact check snapshot contains an aliased directory".into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        directories.insert(relative.clone());
+    }
+    Ok(())
 }
 
 struct Delta<'a> {
@@ -634,4 +786,158 @@ fn secret_path(path: &str) -> bool {
                     .any(|entry| suffix.eq_ignore_ascii_case(*entry))
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_and_diff_overrides_are_removed() {
+        for name in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_PREFIX",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_GRAFT_FILE",
+            "GIT_INDEX_FILE",
+            "GIT_SHALLOW_FILE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_DIFF_OPTS",
+        ] {
+            assert!(inherited_git_override(name), "{name}");
+        }
+        assert!(!inherited_git_override("PATH"));
+        let git = Git {
+            cwd: PathBuf::from("."),
+            prefix: String::new(),
+        };
+        let command = git.command(&["rev-parse", "HEAD"]);
+        let variables: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            variables.get(std::ffi::OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+        assert_eq!(
+            variables.get(std::ffi::OsStr::new("GIT_ALLOW_PROTOCOL")),
+            Some(&Some(std::ffi::OsStr::new("")))
+        );
+        assert!(!command.get_args().any(|arg| arg == "--no-lazy-fetch"));
+    }
+
+    #[test]
+    fn ambiguous_additions_never_read_or_expose_blobs() {
+        let root = tempfile::tempdir().unwrap();
+        let git = Git {
+            cwd: root.path().to_owned(),
+            prefix: String::new(),
+        };
+        let policy = crate::policy::Policy::load(None, None, Vec::new(), None).unwrap();
+        let zero = "0000000000000000000000000000000000000000";
+        let missing = "1111111111111111111111111111111111111111";
+        let delta = Delta {
+            sides: [("000000", zero), ("100644", missing)],
+            change: "added",
+        };
+        let mut remaining = MAX_CLASSIFICATION_BYTES;
+        let protected = git
+            .file(&delta, None, b".env", &policy, &mut remaining, true)
+            .unwrap();
+        assert!(matches!(
+            protected.scope,
+            Selection::Excluded {
+                reason: "secret_path"
+            }
+        ));
+        for path in [b"public.txt".as_slice(), b"non-utf8-\xff"] {
+            let file = git
+                .file(&delta, None, path, &policy, &mut remaining, true)
+                .unwrap();
+            assert!(matches!(
+                file.scope,
+                Selection::Excluded {
+                    reason: "ambiguous_protected_rename"
+                }
+            ));
+            assert!(file.path.is_none() && file.path_bytes_hex.is_none());
+            assert!(file.old_blob.is_none() && file.new_blob.is_none());
+        }
+        assert_eq!(remaining, MAX_CLASSIFICATION_BYTES);
+
+        let renamed = Delta {
+            sides: [("100644", missing), ("100644", missing)],
+            change: "renamed",
+        };
+        let file = git
+            .file(
+                &renamed,
+                Some(b".env"),
+                b"public.txt",
+                &policy,
+                &mut remaining,
+                true,
+            )
+            .unwrap();
+        assert!(matches!(
+            file.scope,
+            Selection::Excluded {
+                reason: "secret_path"
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_directories_follow_filesystem_alias_semantics() {
+        for (first, second) in [("src", "SRC"), ("caf\u{e9}", "cafe\u{301}")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut directories = std::collections::BTreeSet::new();
+            create_snapshot_parents(root.path(), &Path::new(first).join("one"), &mut directories)
+                .unwrap();
+            create_snapshot_parents(root.path(), &Path::new(first).join("two"), &mut directories)
+                .unwrap();
+            let aliases = root.path().join(second).exists();
+            let result = create_snapshot_parents(
+                root.path(),
+                &Path::new(second).join("three"),
+                &mut directories,
+            );
+            assert_eq!(result.is_err(), aliases, "{first:?} and {second:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_snapshot_deadline_refuses_git_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let git = Git {
+            cwd: root.path().to_owned(),
+            prefix: String::new(),
+        };
+        let policy = crate::policy::Policy::load(None, None, Vec::new(), None).unwrap();
+        let error = git
+            .materialize_checks(
+                "1111111111111111111111111111111111111111",
+                root.path(),
+                &policy,
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+    }
 }

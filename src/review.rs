@@ -9,13 +9,12 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use crate::harness::{self, Execution, Status};
-use crate::plan::{Plan, Prepared, digest};
+use crate::plan::{MAX_FINDINGS_PER_FILE, MAX_PROMPT_BYTES, Plan, Prepared, digest};
 use crate::policy::Rule;
-use crate::snapshot::{Comparison, Git};
+use crate::snapshot::{Comparison, Git, Selection};
 use crate::{Result, SCHEMA_VERSION};
 
 const MAX_LOCAL_REPORT: usize = 4 * 1024 * 1024;
-const MAX_FINDINGS_PER_FILE: usize = 8;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Report {
@@ -227,6 +226,7 @@ pub(crate) fn run(
         plan,
         policy,
         prompt,
+        removed_lines,
     } = prepared;
     let checks = if run_checks {
         checks(git, &plan, &policy)
@@ -261,7 +261,7 @@ pub(crate) fn run(
         }
         ("admitted", Some(prompt)) => {
             let execution = harness::run(executable, model, &prompt, timeout);
-            let validation = validate(git, &plan, &execution)?;
+            let validation = validate(git, &plan, &removed_lines, &execution)?;
             coverage = validation.coverage;
             findings = validation.findings;
             leads = validation.leads;
@@ -287,7 +287,11 @@ pub(crate) fn run(
     };
     for check in &checks {
         if check.status != "passed" {
-            reasons.push(format!("Check {}: {}", check.name, check.status));
+            let suffix = check
+                .reason
+                .as_deref()
+                .map_or(String::new(), |reason| format!(" ({reason})"));
+            reasons.push(format!("Check {}: {}{suffix}", check.name, check.status));
         }
     }
     let exclusions = serde_json::to_value(
@@ -325,7 +329,12 @@ struct Validation {
     leads: Vec<Lead>,
 }
 
-fn validate(git: &Git, plan: &Plan, execution: &Execution) -> Result<Validation> {
+fn validate(
+    git: &Git,
+    plan: &Plan,
+    removed_lines: &BTreeMap<String, Vec<usize>>,
+    execution: &Execution,
+) -> Result<Validation> {
     let mut result = Validation {
         coverage: plan
             .unit
@@ -382,7 +391,7 @@ fn validate(git: &Git, plan: &Plan, execution: &Execution) -> Result<Validation>
                 .push("Invalid or unassigned verdict row".to_owned());
         }
     }
-    let mut ids = BTreeSet::new();
+    let mut by_id = BTreeMap::<String, usize>::new();
     for file in &plan.files {
         let Some(path) = file
             .path
@@ -418,7 +427,7 @@ fn validate(git: &Git, plan: &Plan, execution: &Execution) -> Result<Validation>
                 if candidate.line == 0
                     || candidate.note.trim().is_empty()
                     || candidate.note.len() > 2_048
-                    || candidate.excerpt.len() > 4_096
+                    || candidate.excerpt.len() > MAX_PROMPT_BYTES
                     || candidate.excerpt.contains('\n')
                 {
                     bad = true;
@@ -434,6 +443,12 @@ fn validate(git: &Git, plan: &Plan, execution: &Execution) -> Result<Validation>
                     }
                     let content = blobs[index].as_deref().expect("loaded blob");
                     locate(content, candidate.line, &candidate.excerpt)
+                        .filter(|line| {
+                            candidate.side == Side::Head
+                                || removed_lines
+                                    .get(path)
+                                    .is_some_and(|removed| removed.binary_search(line).is_ok())
+                        })
                         .map(|line| (commit, blob, line))
                 } else {
                     None
@@ -451,7 +466,14 @@ fn validate(git: &Git, plan: &Plan, execution: &Execution) -> Result<Validation>
                         &candidate.excerpt,
                         &candidate.note,
                     ))?);
-                    if ids.insert(id.clone()) {
+                    if let Some(&index) = by_id.get(&id) {
+                        let finding = &mut result.findings[index];
+                        finding.severity = finding.severity.min(candidate.severity);
+                        if line == candidate.line {
+                            finding.claimed_line = None;
+                        }
+                    } else {
+                        by_id.insert(id.clone(), result.findings.len());
                         result.findings.push(Finding {
                             id,
                             path: anchor_path.to_owned(),
@@ -531,7 +553,7 @@ fn checks(git: &Git, plan: &Plan, policy: &crate::policy::Policy) -> Vec<Check> 
     use std::process::Command;
     use std::time::Instant;
 
-    let start = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(45);
     plan.checks
         .iter()
         .map(|planned| {
@@ -543,27 +565,29 @@ fn checks(git: &Git, plan: &Plan, policy: &crate::policy::Policy) -> Vec<Check> 
                 if plan
                     .files
                     .iter()
-                    .any(|file| file.change == "renamed" && file.path.is_none())
+                    .any(|file| (file.change == "renamed" && file.path.is_none()) || matches!(
+                        file.scope, Selection::Excluded { reason: "ambiguous_protected_rename" }
+                    ))
                 {
                     return Err(
-                        "Exact check snapshot contains a protected or unsupported rename".into(),
+                        "Exact check snapshot contains a protected, ambiguous, or unsupported rename".into(),
                     );
                 }
-                if start.elapsed() >= Duration::from_secs(45) {
+                if Instant::now() >= deadline {
                     return Err("Check stage deadline reached".into());
                 }
                 let scratch = tempfile::tempdir()?;
                 let tree = scratch.path().join("tree");
                 fs::create_dir(&tree)?;
                 #[cfg(unix)]
-                git.materialize_checks(&plan.comparison.head, &tree, policy)?;
+                git.materialize_checks(&plan.comparison.head, &tree, policy, deadline)?;
                 #[cfg(not(unix))]
                 return Err("Exact check snapshots are unsupported on this platform".into());
                 let home = scratch.path().join("home");
                 fs::create_dir(&home)?;
                 let command = &policy.checks[&planned.name];
-                let limit = Duration::from_secs(45)
-                    .saturating_sub(start.elapsed())
+                let limit = deadline
+                    .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(15));
                 if limit.is_zero() {
                     return Err("Check stage deadline reached".into());
@@ -640,10 +664,20 @@ pub(crate) fn save(git: &Git, report: &mut Report) -> Result<()> {
     file.write_all(&encoded)?;
     let target = dir.join(format!("{}.json", report.run_id));
     file.persist_noclobber(target)?;
-    let mut latest = tempfile::NamedTempFile::new_in(&dir)?;
-    latest.write_all(report.run_id.as_bytes())?;
-    latest.persist(dir.join("latest"))?;
-    Ok(())
+    let update_latest = || -> std::io::Result<()> {
+        let mut latest = tempfile::NamedTempFile::new_in(&dir)?;
+        latest.write_all(report.run_id.as_bytes())?;
+        latest
+            .persist(dir.join("latest"))
+            .map_err(|err| err.error)?;
+        Ok(())
+    };
+    update_latest().map_err(|err| {
+        format!(
+            "Saved review {}; could not update latest: {err}. Recover with `revkit findings --run {}`.",
+            report.run_id, report.run_id
+        ).into()
+    })
 }
 
 pub(crate) fn load(git: &Git, run_id: Option<&str>) -> Result<Report> {

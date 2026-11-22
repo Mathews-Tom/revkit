@@ -7,6 +7,16 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
+fn isolated_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 struct Repo(tempfile::TempDir);
 
 impl Repo {
@@ -21,7 +31,7 @@ impl Repo {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = isolated_command("git")
             .args(args)
             .current_dir(self.root())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -49,7 +59,7 @@ impl Repo {
     }
 
     fn cli(&self, code: i32, args: &[&str]) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_revkit"))
+        let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
             .args(args)
             .current_dir(self.root())
             .output()
@@ -126,13 +136,15 @@ fn verdicts(rows: &[Value]) -> Value {
 fn setup_plan_and_rule_provenance_use_only_pinned_git_inputs() {
     let repo = Repo::new();
     let init = repo.cli(0, &["init", "--format", "json"]);
-    assert!(
-        init["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|file| file["status"] == "created")
+    assert_eq!(
+        init["files"],
+        json!([
+            {"path":".revkit/config.toml","status":"created"},
+            {"path":".revkit/policy.toml","status":"created"}
+        ])
     );
+    assert!(repo.root().join(".revkit/config.toml").is_file());
+    assert!(repo.root().join(".revkit/policy.toml").is_file());
     repo.write(
         ".revkit/config.toml",
         "version=1\n[scope]\nexclude=['skip.txt']\n[checks]\nsyntax='exit 1'\n",
@@ -440,7 +452,7 @@ fn operator_interrupt_stops_the_active_reviewer() {
         "waiting-reviewer",
         "echo $$ > \"$FIXTURE_MARKER\"\nsleep 30 &\nwait",
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_revkit"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_revkit"))
         .current_dir(repo.root())
         .env("FIXTURE_MARKER", &marker)
         .args([
@@ -486,4 +498,239 @@ fn operator_interrupt_stops_the_active_reviewer() {
             .as_str()
             .is_some_and(|reason| reason.contains("operator interrupt"))
     }));
+}
+
+#[test]
+fn review_harness_uses_the_same_relative_path_lookup_as_doctor() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    repo.stub(verdicts(&[clean("file.txt")]), true);
+    let run = |args: &[&str]| {
+        let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
+            .current_dir(repo.root())
+            .env("PATH", ".git:/usr/bin:/bin")
+            .args(args)
+            .args([
+                "--harness",
+                "offline-reviewer",
+                "--model",
+                "fixture/model",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(run(&["doctor"])["ready"], true);
+    assert_eq!(
+        run(&["review", "--base", "main", "--trusted-local"])["status"],
+        "clean"
+    );
+}
+
+#[test]
+fn rename_preserves_source_and_destination_policy() {
+    let repo = Repo::new();
+    repo.write(
+        ".revkit/config.toml",
+        "version=1\n[tiers]\nhigh=['sensitive/**']\nlow=['docs/**']\n[checks]\ninspect='true'\n",
+    );
+    repo.write(
+        ".revkit/rules/source.md",
+        "---\nid: source-rule\npaths: ['sensitive/**']\n---\nPreserve the source invariant.\n",
+    );
+    repo.write(
+        ".revkit/rules/dest.md",
+        "---\nid: dest-rule\npaths: ['docs/**']\n---\nPreserve the destination invariant.\n",
+    );
+    repo.write("sensitive/file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    fs::create_dir(repo.root().join("docs")).unwrap();
+    fs::rename(
+        repo.root().join("sensitive/file.txt"),
+        repo.root().join("docs/file.txt"),
+    )
+    .unwrap();
+    repo.checkpoint("rename");
+    let plan = repo.cli(0, &["plan", "--base", "main", "--format", "json"]);
+    assert_eq!(plan["tier"], "high");
+    assert_eq!(plan["admission"]["status"], "admitted");
+    assert_eq!(
+        plan["effective_rules"]["docs/file.txt"],
+        json!(["dest-rule", "source-rule"])
+    );
+}
+
+#[test]
+fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
+    let repo = Repo::new();
+    repo.write("file.txt", "unchanged\nremoved\ntrailing\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    let long_line = "x".repeat(4_097);
+    repo.write("file.txt", &format!("unchanged\n{long_line}\ntrailing\n"));
+    repo.checkpoint("head");
+
+    let mut combined = finding("file.txt", "head", 2, &long_line);
+    let entries = combined["findings"].as_array_mut().unwrap();
+    entries.push(finding("file.txt", "base", 2, "removed")["findings"][0].clone());
+    let report = repo.review(2, &repo.stub(verdicts(&[combined]), true), &[]);
+    assert_eq!(report["findings"].as_array().unwrap().len(), 2);
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["excerpt"] == long_line)
+    );
+    let invalid = finding("file.txt", "base", 1, "unchanged");
+    let report = repo.review(3, &repo.stub(verdicts(&[invalid]), true), &[]);
+    assert_eq!(report["findings"], json!([]));
+    assert_eq!(report["leads"][0]["reason"], "invalid_anchor");
+    assert_eq!(report["coverage"]["file.txt"], "unsettled");
+}
+
+#[test]
+fn duplicate_findings_keep_the_strongest_severity() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+
+    let mut advisory = finding("file.txt", "head", 1, "after");
+    advisory["findings"][0]["severity"] = json!("P3");
+    let report = repo.review(0, &repo.stub(verdicts(&[advisory.clone()]), true), &[]);
+    let id = &report["findings"][0]["id"];
+    let mut blocking = advisory["findings"][0].clone();
+    blocking["severity"] = json!("P1");
+    advisory["findings"].as_array_mut().unwrap().push(blocking);
+    for _ in 0..2 {
+        let report = repo.review(2, &repo.stub(verdicts(&[advisory.clone()]), true), &[]);
+        assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(&report["findings"][0]["id"], id);
+        assert_eq!(report["findings"][0]["severity"], "P1");
+        advisory["findings"].as_array_mut().unwrap().reverse();
+    }
+}
+
+#[test]
+fn saved_review_can_be_recovered_when_latest_cannot_be_replaced() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    fs::create_dir_all(repo.root().join(".git/revkit/latest")).unwrap();
+    let report = repo.review(
+        1,
+        &repo.stub(verdicts(&[finding("file.txt", "head", 1, "after")]), true),
+        &[],
+    );
+    let message = report["error"]["message"].as_str().unwrap();
+    let id = message
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(';');
+    assert!(message.contains(&format!("revkit findings --run {id}")));
+    let saved = repo.cli(0, &["findings", "--run", id, "--format", "json"]);
+    assert_eq!(saved["findings"][0]["excerpt"], "after");
+}
+
+#[test]
+fn ambiguous_protected_moves_are_withheld_from_review_and_checks() {
+    let repo = Repo::new();
+    repo.write(
+        ".revkit/config.toml",
+        "version=1\n[checks]\ninspect='exit 99'\n",
+    );
+    repo.write(".env", "synthetic original line\n");
+    repo.write("known.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    fs::remove_file(repo.root().join(".env")).unwrap();
+    repo.write("new.txt", "substantially rewritten synthetic content\n");
+    repo.write("known.txt", "after\n");
+    repo.checkpoint("head");
+    let plan = repo.cli(0, &["plan", "--base", "main", "--format", "json"]);
+    assert_eq!(plan["unit"], json!(["known.txt"]));
+    assert!(plan["files"].as_array().unwrap().iter().any(|file| {
+        file["scope"]["reason"] == "ambiguous_protected_rename" && file["new_blob"].is_null()
+    }));
+    let stub = repo.stub(verdicts(&[clean("known.txt")]), true);
+    let sarif = repo.cli(
+        5,
+        &[
+            "review",
+            "--base",
+            "main",
+            "--trusted-local",
+            "--run-checks",
+            "--harness",
+            stub.to_str().unwrap(),
+            "--model",
+            "fixture/model",
+            "--format",
+            "sarif",
+        ],
+    );
+    assert!(
+        sarif["runs"][0]["properties"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.as_str().is_some_and(|reason| {
+                    reason.contains("Check inspect: unavailable") && reason.contains("ambiguous")
+                })
+            })
+    );
+}
+
+#[test]
+fn inherited_git_location_and_diff_options_cannot_override_a_plan() {
+    let other = Repo::new();
+    other.write("wrong.txt", "other checkout\n");
+    other.checkpoint("other");
+    let repo = Repo::new();
+    let context = format!(
+        "{}\n",
+        "unchanged context line with over forty bytes\n".repeat(1_400)
+    );
+    repo.write("right.txt", &format!("{context}before\n"));
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("right.txt", &format!("{context}after\n"));
+    let head = repo.checkpoint("head");
+    let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
+        .current_dir(repo.root())
+        .env("GIT_DIR", other.root().join(".git"))
+        .env("GIT_WORK_TREE", other.root())
+        .env("GIT_DIFF_OPTS", "--unified=1500")
+        .args(["plan", "--base", "main", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["comparison"]["head"], head);
+    assert_eq!(plan["unit"], json!(["right.txt"]));
+    assert_eq!(plan["admission"]["status"], "admitted");
 }
