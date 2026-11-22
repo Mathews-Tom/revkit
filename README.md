@@ -44,6 +44,8 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
+Run `revkit findings --run ID` in text mode to see the saved head, per-file coverage, and reasons alongside anchored findings. This is a lookup; it does not run the model or checks and can succeed even when the saved review was incomplete.
+
 | Exit | Meaning |
 |---|---|
 | `0` | Passed within the reported scope or successful lookup; P3 findings are advisory |

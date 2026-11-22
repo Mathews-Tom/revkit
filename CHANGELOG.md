@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Distinguish offline review request size from harness-reported token counters and show the counters in the default review output.
+- Show the saved head, per-file coverage, and run reasons when listing saved findings in text mode.
 
 ## 0.1.1
 

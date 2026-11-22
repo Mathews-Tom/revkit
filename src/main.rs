@@ -220,6 +220,10 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
                     "head": report.comparison.head, "status": report.status, "findings": findings}),
                     |out| {
                         writeln!(out, "Review {} ({})", report.run_id, report.status.name())?;
+                        if id.is_none() {
+                            writeln!(out, "Head: {}", report.comparison.head)?;
+                            text_review_coverage(out, &report)?;
+                        }
                         if findings.is_empty() {
                             writeln!(out, "No anchored findings.")?;
                         }
@@ -466,12 +470,7 @@ fn show_report(out: &mut impl Write, format: Format, report: &Report) -> Result<
             write!(out, " not reported")?;
         }
         writeln!(out)?;
-        for (path, status) in &report.coverage {
-            writeln!(out, "  {path:?}: {status}")?;
-        }
-        for reason in &report.reasons {
-            writeln!(out, "  {reason:?}")?;
-        }
+        text_review_coverage(out, report)?;
         for check in &report.checks {
             writeln!(out, "Check {}: {}", check.name, check.status)?;
         }
@@ -493,6 +492,16 @@ fn show_report(out: &mut impl Write, format: Format, report: &Report) -> Result<
         }
         Ok(())
     })
+}
+
+fn text_review_coverage(out: &mut dyn Write, report: &Report) -> io::Result<()> {
+    for (path, status) in &report.coverage {
+        writeln!(out, "  {path:?}: {status}")?;
+    }
+    for reason in &report.reasons {
+        writeln!(out, "  {reason:?}")?;
+    }
+    Ok(())
 }
 
 fn text_finding(out: &mut dyn Write, finding: &review::Finding) -> io::Result<()> {
