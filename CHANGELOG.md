@@ -1,0 +1,7 @@
+# Changelog
+
+## Unreleased
+
+- Add `init`, `doctor`, and an offline `plan` for pinned Git ranges and single commits. Show trusted-base rules, scope, planned checks, and single-unit admission without running a reviewer or checks.
+- Add explicit trusted-local OMP review with typed per-file coverage, exact anchors, opt-in head checks, and distinct incomplete and unavailable outcomes.
+- Add versioned JSON and SARIF reports plus local finding and effective-rule lookup.

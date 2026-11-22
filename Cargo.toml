@@ -1,0 +1,20 @@
+[package]
+name = "revkit"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Pre-push review of committed changes"
+repository = "https://github.com/Mathews-Tom/revkit"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+globset = "0.4"
+libc = "0.2"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.9"
