@@ -361,6 +361,23 @@ fn review_distinguishes_typed_completion_and_preserves_verified_findings() {
     assert_eq!(positive["findings"][0]["claimed_line"], 99);
     assert_eq!(positive["findings"][0]["id"], missing["findings"][0]["id"]);
     assert_eq!(positive["findings"][1]["commit"], base);
+    let saved = repo.cli_stdout(
+        0,
+        &["findings", "--run", missing["run_id"].as_str().unwrap()],
+    );
+    let saved = String::from_utf8(saved).unwrap();
+    assert!(saved.contains(&format!("Head: {head}\n")), "{saved}");
+    assert!(saved.contains("\"display.py\": unsettled"), "{saved}");
+    assert!(
+        saved.contains("\"delivery.py\": settled_with_findings"),
+        "{saved}"
+    );
+    assert!(saved.contains("Missing verdict:"), "{saved}");
+    assert!(
+        saved.contains(missing["findings"][0]["id"].as_str().unwrap()),
+        "{saved}"
+    );
+
     let id = positive["findings"][0]["id"].as_str().unwrap();
     let by_id = repo.cli(
         0,
