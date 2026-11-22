@@ -34,7 +34,9 @@ The crate distributes source; Cargo builds the CLI on the user's machine. This f
 
 ## Enable future releases with Trusted Publishing
 
-1. In [GitHub → Settings → Environments](https://github.com/Mathews-Tom/revkit/settings/environments), create `crates-io`. Under **Deployment branches and tags**, choose **Selected branches and tags**. Add a **Tag** rule for `v*`, with no branch rule. Protect `v*` with a [tag ruleset](https://github.com/Mathews-Tom/revkit/settings/rules): restrict creation to release maintainers and prevent updates and deletions. Configure these controls before adding registry trust.
+1. In [GitHub → Settings → Environments](https://github.com/Mathews-Tom/revkit/settings/environments), create `crates-io`. Under **Deployment branches and tags**, choose **Selected branches and tags**. Add a **Tag** rule for `v*`, with no branch rule. Configure two active [tag rulesets](https://github.com/Mathews-Tom/revkit/settings/rules) targeting `v*` before adding registry trust:
+   - **Creation:** enable **Restrict creations** only. Give bypass permission only to release maintainers. Leave **Restrict deletions** unchecked here; GitHub selects it by default.
+   - **Immutability:** enable **Restrict updates** and **Restrict deletions** with no bypass actors. The creation bypass must not let maintainers move or delete release tags.
 2. As the crate owner, open [New trusted publisher](https://crates.io/crates/revkit/settings/new-trusted-publisher) and use these values. The workflow field is the **filename**, not the repository-relative path or the display name.
 
    | Field | Value |
