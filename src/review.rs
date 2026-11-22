@@ -34,7 +34,7 @@ pub(crate) struct Report {
     pub(crate) rules: Vec<Rule>,
     pub(crate) exclusions: Value,
     model: Option<String>,
-    usage: Option<Value>,
+    pub(crate) usage: Option<Value>,
     elapsed_ms: u128,
 }
 

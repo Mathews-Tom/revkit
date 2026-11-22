@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Distinguish offline review request size from harness-reported token counters and show the counters in the default review output.
+
 ## 0.1.1
 
 - First release through crates.io Trusted Publishing. No CLI or dependency changes since `0.1.0`.
