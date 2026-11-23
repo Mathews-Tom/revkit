@@ -112,6 +112,7 @@ struct Transcript {
     model: Option<String>,
     usage: Option<serde_json::Value>,
     stopped: bool,
+    provider_error_status: Option<u64>,
     terminal: bool,
     tools: bool,
     malformed: bool,
@@ -232,12 +233,18 @@ impl Transcript {
         self.tools |= tool_call;
         let usable = !text.trim().is_empty();
         if ended {
-            self.stopped = usable
-                && !tool_call
-                && message
-                    .get("stopReason")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("stop");
+            let stop_reason = message
+                .get("stopReason")
+                .and_then(serde_json::Value::as_str);
+            self.stopped = usable && !tool_call && stop_reason == Some("stop");
+            self.provider_error_status = if stop_reason == Some("error") {
+                message
+                    .get("errorStatus")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|status| (400..600).contains(status))
+            } else {
+                None
+            };
         }
         if usable {
             self.final_text = Some(text);
@@ -245,8 +252,15 @@ impl Transcript {
     }
 
     fn finish(self, success: bool, failure: Option<&str>) -> Execution {
-        let reason = failure.or({
-            if !success {
+        let reason = if let Some(failure) = failure {
+            Some(failure.to_owned())
+        } else if !self.malformed
+            && !self.tools
+            && let Some(status) = self.provider_error_status
+        {
+            Some(format!("OMP reported an upstream error (HTTP {status})."))
+        } else {
+            let reason = if !success {
                 Some("OMP exited unsuccessfully.")
             } else if self.malformed {
                 Some("OMP returned an invalid event stream.")
@@ -258,8 +272,9 @@ impl Transcript {
                 Some("OMP did not finish with a terminal agent_end event.")
             } else {
                 None
-            }
-        });
+            };
+            reason.map(str::to_owned)
+        };
         Execution {
             status: if reason.is_none() {
                 Status::Complete
@@ -269,7 +284,7 @@ impl Transcript {
             final_text: self.final_text,
             model: self.model,
             usage: self.usage,
-            reason: reason.map(str::to_owned),
+            reason,
         }
     }
 }

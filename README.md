@@ -46,6 +46,8 @@ Use `--format json` for versioned structured output, or `--format sarif` with `r
 
 Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. The published 0.1.0 and 0.1.1 builds list anchored findings but do not show these details in text mode. This lookup does not run the model or checks and can succeed even when the saved review was incomplete.
 
+The unreleased build reports a numeric upstream HTTP error status when OMP supplies one on the failed assistant response. It does not copy OMP's raw error message. A process deadline is reported as a timeout, not an inferred provider error.
+
 | Exit | Meaning |
 |---|---|
 | `0` | Passed within the reported scope or successful lookup; P3 findings are advisory |
