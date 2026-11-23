@@ -433,6 +433,49 @@ fn checks_require_opt_in_and_each_reads_the_pinned_snapshot() {
 }
 
 #[test]
+fn reviewer_reports_http_status_without_disclosing_error_text() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let error = json!({"type":"message_end","message":{
+        "role":"assistant","stopReason":"error","content":[],
+        "errorStatus":429,"errorMessage":"private upstream details"
+    }});
+    let completion = json!({"type":"message_end","message":{
+        "role":"assistant","stopReason":"stop",
+        "content":[{"type":"text","text":verdicts(&[clean("file.txt")]).to_string()}]
+    }});
+    let terminal = json!({"type":"agent_end","isTerminal":true});
+    let stub = repo.runner(
+        "rate-limited-reviewer",
+        &format!("cat <<'EVENTS'\n{error}\n{terminal}\nEVENTS\nexit 1"),
+    );
+    let report = repo.review(3, &stub, &[]);
+    assert_eq!(report["status"], "incomplete");
+    assert_eq!(report["coverage"]["file.txt"], "unsettled");
+    assert_eq!(
+        report["reasons"],
+        json!([
+            "OMP reported an upstream error (HTTP 429).",
+            "No final reviewer verdict"
+        ])
+    );
+    assert!(!report.to_string().contains("private upstream details"));
+
+    let stub = repo.runner(
+        "recovered-reviewer",
+        &format!("cat <<'EVENTS'\n{error}\n{completion}\n{terminal}\nEVENTS"),
+    );
+    let report = repo.review(0, &stub, &[]);
+    assert_eq!(report["status"], "clean");
+    assert_eq!(report["coverage"]["file.txt"], "settled_no_findings");
+    assert_eq!(report["reasons"], json!([]));
+}
+
+#[test]
 fn timeout_remains_incomplete_with_a_descendant_holding_output_open() {
     let repo = Repo::new();
     repo.write("file.txt", "before\n");

@@ -4,6 +4,7 @@
 
 - Distinguish offline review request size from harness-reported token counters and show the counters in the default review output.
 - Show the saved head, per-file coverage, and run reasons when listing saved findings in text mode.
+- Show OMP-reported upstream HTTP error statuses without saving raw provider diagnostics; keep process timeouts distinct.
 
 ## 0.1.1
 
