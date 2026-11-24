@@ -217,7 +217,8 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
                     out,
                     format,
                     &json!({"kind": "findings", "schema_version": SCHEMA_VERSION, "run_id": report.run_id,
-                    "head": report.comparison.head, "status": report.status, "findings": findings}),
+                    "head": report.comparison.head, "status": report.status,
+                    "coverage": report.coverage, "reasons": report.reasons, "findings": findings}),
                     |out| {
                         writeln!(out, "Review {} ({})", report.run_id, report.status.name())?;
                         if id.is_none() {

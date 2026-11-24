@@ -44,7 +44,7 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
-Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. The published 0.1.0 and 0.1.1 builds list anchored findings but do not show these details in text mode. This lookup does not run the model or checks and can succeed even when the saved review was incomplete.
+Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. JSON output includes the saved `coverage` map and `reasons` array, even when filtering by finding ID. The published 0.1.0 and 0.1.1 builds omit coverage and reasons from this lookup. A successful lookup does not mean the saved review completed; check its status. The lookup does not run the model or checks.
 
 The unreleased build reports a numeric upstream HTTP error status when OMP supplies one on the failed assistant response. It does not copy OMP's raw error message. A process deadline is reported as a timeout, not an inferred provider error.
 
