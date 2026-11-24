@@ -378,6 +378,21 @@ fn review_distinguishes_typed_completion_and_preserves_verified_findings() {
         "{saved}"
     );
 
+    let saved_json = repo.cli(
+        0,
+        &[
+            "findings",
+            "--run",
+            missing["run_id"].as_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(saved_json["status"], "incomplete");
+    assert_eq!(saved_json["coverage"], missing["coverage"]);
+    assert_eq!(saved_json["reasons"], missing["reasons"]);
+    assert_eq!(saved_json["findings"], missing["findings"]);
+
     let id = positive["findings"][0]["id"].as_str().unwrap();
     let by_id = repo.cli(
         0,
