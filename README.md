@@ -28,7 +28,7 @@ Git object reads are local-only. If a partial clone lacks a required object, fet
 
 ## Trust and scope
 
-`--trusted-local` is for trusted checkouts only. This is **not a sandbox**. Revkit starts one fresh tool-disabled OMP session using your existing configuration. Set `--harness /path/to/omp` or `--model provider/model` to select explicitly. Revkit does not sign in, check billing, or try another model. Review sends the filtered patch, effective rules, and supplied requirements; only supply and review material you authorize that harness and model to receive. A local timeout is not a provider usage cap.
+`--trusted-local` is for trusted checkouts only. This is **not a sandbox**. Revkit starts one fresh OMP session using your existing configuration and passes `--no-tools`. OMP can still advertise optional tools; Revkit rejects a result if it observes a tool attempt, but this does not prevent tool execution or side effects. Set `--harness /path/to/omp` or `--model provider/model` to select explicitly. Revkit does not sign in, check billing, or try another model. Review sends the filtered patch, effective rules, and supplied requirements; only supply and review material you authorize that harness and model to receive. A local timeout is not a provider usage cap.
 
 Use `[scope] deny`, `exclude`, `generated`, and `include` arrays of repository-relative globs in `.revkit/config.toml`. Include overrides generated exclusions, not deny or explicit exclusion. `.revkit/policy.toml` can supply additional `deny` globs. Common secret paths are withheld. Symlinks, gitlinks, binary and unsupported files are not reviewed. Deletions supply context, not file verdicts. Plans that exceed the single-unit limits are not partially dispatched.
 

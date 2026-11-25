@@ -6,6 +6,7 @@
 - Show the saved head, per-file coverage, and run reasons when listing saved findings in text mode.
 - Show OMP-reported upstream HTTP error statuses without saving raw provider diagnostics; keep process timeouts distinct.
 - Include per-file coverage and run reasons in saved findings JSON.
+- Clarify that OMP's `--no-tools` flag and Revkit's rejection of observed tool attempts do not guarantee tool isolation.
 
 ## 0.1.1
 
