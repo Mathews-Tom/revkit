@@ -28,7 +28,11 @@ Git object reads are local-only. If a partial clone lacks a required object, fet
 
 ## Trust and scope
 
-`--trusted-local` is for trusted checkouts only. This is **not a sandbox**. Revkit starts one fresh OMP session using your existing configuration and passes `--no-tools`. OMP can still advertise optional tools; Revkit rejects a result if it observes a tool attempt, but this does not prevent tool execution or side effects. Set `--harness /path/to/omp` or `--model provider/model` to select explicitly. Revkit does not sign in, check billing, or try another model. Review sends the filtered patch, effective rules, and supplied requirements; only supply and review material you authorize that harness and model to receive. A local timeout is not a provider usage cap.
+`--trusted-local` is for trusted checkouts only. This is **not a sandbox**. Revkit starts one fresh OMP session using your existing configuration and passes `--no-tools`. Revkit rejects a result if it observes a tool attempt, but this does not prevent tool execution or side effects.
+
+OMP tool isolation depends on the installed version. OMP 19.1.1 started configured MCP connectors and could advertise tools despite `--no-tools`. With OMP 19.2.1, offline tests using the Opus review route and synthetic connector configurations observed zero advertised tools and no native or project MCP connector startup under Revkit's existing launch flags. OMP 19.2.1 also rejects combining `--no-tools` with explicit extensions or hooks. Keep the flag enabled; do not weaken isolation to load instrumentation. These observations are version-specific, not a general confinement guarantee or qualification of every connector, provider, or profile.
+
+Set `--harness /path/to/omp` or `--model provider/model` to select explicitly. Revkit does not sign in, check billing, or try another model. Review sends the filtered patch, effective rules, and supplied requirements; only supply and review material you authorize that harness and model to receive. A local timeout is not a provider usage cap.
 
 Use `[scope] deny`, `exclude`, `generated`, and `include` arrays of repository-relative globs in `.revkit/config.toml`. Include overrides generated exclusions, not deny or explicit exclusion. `.revkit/policy.toml` can supply additional `deny` globs. Common secret paths are withheld. Symlinks, gitlinks, binary and unsupported files are not reviewed. Deletions supply context, not file verdicts. Plans that exceed the single-unit limits are not partially dispatched.
 
