@@ -4,10 +4,11 @@ Rust CLI for pre-push review of committed changes. The initial supported target 
 
 ## Quickstart
 
-Install the published 0.1.0 crate with Git and a current stable Rust toolchain, or build from a source checkout with `cargo install --locked --path /path/to/revkit`. Review requires an already-configured `omp`; `plan` does not require `omp` or make a model call.
+Install the published 0.1.1 crate with Git and a current stable Rust toolchain, or build from a source checkout with `cargo install --locked --path /path/to/revkit`. Review requires an already-configured `omp`; `plan` does not require `omp` or make a model call.
 
 ```sh
-cargo install --locked revkit --version 0.1.0
+cargo install --locked revkit --version '=0.1.1'
+revkit --version
 revkit init
 revkit doctor
 ```
@@ -44,7 +45,7 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 ## Results
 
-`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. In the unreleased source build, the default text review report shows the token counters OMP returned, or `not reported` if none are available. These counters do not establish billed usage or subscription quota consumption.
+`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. With released Revkit 0.1.1, select `--format json` on the review command itself to inspect the returned `usage` object. The unreleased source build also displays reported counters in the default text review output. Keep the reported field names (including `cacheRead` and `cacheWrite` when present); do not sum an existing `totalTokens` counter with its components. Missing counters are unknown, not zero. These counters do not establish billed usage or subscription quota consumption, and comparing different changes does not isolate harness overhead.
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
