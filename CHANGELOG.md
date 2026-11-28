@@ -2,11 +2,13 @@
 
 ## Unreleased
 
+- Replace model-generated source excerpts and line numbers with deterministic request-scoped diff anchors; resolve coordinates and excerpts against pinned Git blobs, and reject unknown or cross-file identifiers without marking the path clean.
 - Distinguish offline review request size from harness-reported token counters and show the counters in the default review output.
 - Show the saved head, per-file coverage, and run reasons when listing saved findings in text mode.
 - Show OMP-reported upstream HTTP error statuses without saving raw provider diagnostics; keep process timeouts distinct.
 - Include per-file coverage and run reasons in saved findings JSON.
 - Document the version-specific `--no-tools` isolation observations for OMP 19.1.1 and 19.2.1, including the latter's explicit extension and hook restriction. Revkit remains trusted-local, not a sandbox.
+- Record default-on owner-private local review metrics with an opt-out, selectable ignored repository store, per-attempt and deduplicated explicit PR counts, bounded retention, and offline inspection/deletion.
 
 ## 0.1.1
 

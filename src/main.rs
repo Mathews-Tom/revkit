@@ -1,4 +1,5 @@
 mod harness;
+mod metrics;
 mod plan;
 mod policy;
 mod review;
@@ -11,7 +12,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -109,6 +110,8 @@ enum Command {
         run_checks: bool,
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=180))]
         timeout_seconds: u64,
+        #[command(flatten)]
+        metrics: metrics::Options,
     },
     /// Read anchored findings from a saved local review.
     Findings {
@@ -121,6 +124,13 @@ enum Command {
         #[command(subcommand)]
         command: RulesCommand,
     },
+    /// Inspect or explicitly delete local review metrics.
+    Metrics {
+        #[arg(long, value_enum, default_value = "global", global = true)]
+        store: metrics::Location,
+        #[command(subcommand)]
+        command: MetricsCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,6 +141,14 @@ enum RulesCommand {
         #[arg(long)]
         run: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum MetricsCommand {
+    /// Show aggregate counts for retained attempts.
+    Show,
+    /// Delete retained attempts and the PR attribution key from the selected store.
+    Clear,
 }
 
 fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
@@ -163,6 +181,20 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
     if let Some(repo) = cli.repo {
         env::set_current_dir(repo)?;
     }
+    if let Command::Metrics { store, command } = &cli.command {
+        let git = match store {
+            metrics::Location::Global => None,
+            metrics::Location::Repository => Some(Git::current()?),
+        };
+        let summary = match command {
+            MetricsCommand::Show => metrics::show(*store, git.as_ref())?,
+            MetricsCommand::Clear => metrics::clear(*store, git.as_ref())?,
+        };
+        return emit(out, cli.format, &summary, |out| {
+            writeln!(out, "{}", serde_json::to_string_pretty(&summary)?)
+        })
+        .map(|_| 0);
+    }
     let git = Git::current()?;
     let format = cli.format;
     match cli.command {
@@ -182,23 +214,40 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
             trusted_local,
             run_checks,
             timeout_seconds,
+            metrics,
         } => {
             if !trusted_local {
                 return Err("Review requires --trusted-local".into());
             }
-            harness::install_interrupts()?;
-            let prepared = plan::prepare(&git, target.pin(&git)?, &target.requirements)?;
-            let mut report = review::run(
+            let start = Instant::now();
+            let mut report = None;
+            let result = (|| {
+                harness::install_interrupts()?;
+                let prepared = plan::prepare(&git, target.pin(&git)?, &target.requirements)?;
+                report = Some(review::run(
+                    &git,
+                    prepared,
+                    &runtime.harness,
+                    runtime.model.as_deref(),
+                    Duration::from_secs(timeout_seconds),
+                    run_checks,
+                )?);
+                let report = report.as_mut().expect("review returned a report");
+                review::save(&git, report)?;
+                show_report(out, format, report)?;
+                Ok(report.exit_code())
+            })();
+            if let Err(err) = metrics::record(
                 &git,
-                prepared,
-                &runtime.harness,
+                &metrics,
                 runtime.model.as_deref(),
-                Duration::from_secs(timeout_seconds),
-                run_checks,
-            )?;
-            review::save(&git, &mut report)?;
-            show_report(out, format, &report)?;
-            return Ok(report.exit_code());
+                report.as_ref(),
+                start.elapsed().as_millis(),
+                result.as_ref().copied().unwrap_or(1),
+            ) {
+                eprintln!("Warning: local metrics not recorded: {err}");
+            }
+            return result;
         }
         Command::Findings { id, run } => {
             let report = review::load(&git, run.as_deref())?;
@@ -276,6 +325,7 @@ fn run(mut cli: Cli, out: &mut impl Write) -> Result<u8> {
                 },
             )?;
         }
+        Command::Metrics { .. } => unreachable!("metrics handled before repository discovery"),
     }
     Ok(0)
 }

@@ -66,6 +66,7 @@ impl Repo {
         let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
             .args(args)
             .current_dir(self.root())
+            .env("HOME", self.root().join(".git"))
             .output()
             .unwrap();
         assert_eq!(
@@ -89,6 +90,7 @@ impl Repo {
     fn stub(&self, completion: Value, terminal: bool) -> PathBuf {
         let messages = json!({"type":"message_end", "message":{
             "role":"assistant", "stopReason":"stop", "model":"scripted-model",
+            "provider":"fixture-observed",
             "usage":{"input":420,"output":25}, "content":[{"type":"text", "text":completion.to_string()}]}});
         self.runner(
             "offline-reviewer",
@@ -129,8 +131,8 @@ EVENTS
 fn clean(path: &str) -> Value {
     json!({"path":path,"verdict":"clean","findings":[]})
 }
-fn finding(path: &str, side: &str, line: usize, excerpt: &str) -> Value {
-    json!({"path":path,"verdict":"finding","findings":[{"severity":"P2","side":side,"line":line,"excerpt":excerpt,"note":"Preview uses the live delivery mode."}]})
+fn finding(path: &str, anchor_id: &str) -> Value {
+    json!({"path":path,"verdict":"finding","findings":[{"severity":"P2","anchor_id":anchor_id,"note":"Preview uses the live delivery mode."}]})
 }
 fn verdicts(rows: &[Value]) -> Value {
     json!({"complete":true,"verdicts":rows})
@@ -288,7 +290,7 @@ fn review_distinguishes_typed_completion_and_preserves_verified_findings() {
     repo.write("display.py", "return 'Status: ' + label\n");
     let head = repo.checkpoint("change");
     repo.write("delivery.py", "false dirty anchor\n");
-    let anchor = finding("delivery.py", "head", 2, "    return 'live'");
+    let anchor = finding("delivery.py", "a3");
     let unknown = repo.root().join("missing-executable");
     assert_eq!(
         repo.cli(
@@ -326,17 +328,25 @@ fn review_distinguishes_typed_completion_and_preserves_verified_findings() {
     let invalid = repo.review(
         3,
         &repo.stub(
-            verdicts(&[
-                finding("delivery.py", "head", 1, "false dirty anchor"),
-                clean("display.py"),
-            ]),
+            verdicts(&[finding("delivery.py", "a999"), clean("display.py")]),
             true,
         ),
         &[],
     );
-    assert_eq!(invalid["leads"][0]["reason"], "invalid_anchor");
+    assert_eq!(invalid["leads"][0]["reason"], "unknown_anchor_id");
     assert_eq!(invalid["findings"], json!([]));
     assert_eq!(invalid["coverage"]["display.py"], "settled_no_findings");
+    let cross_file = repo.review(
+        3,
+        &repo.stub(
+            verdicts(&[finding("delivery.py", "a5"), clean("display.py")]),
+            true,
+        ),
+        &[],
+    );
+    assert_eq!(cross_file["leads"][0]["reason"], "anchor_path_mismatch");
+    assert_eq!(cross_file["coverage"]["delivery.py"], "unsettled");
+    assert_eq!(cross_file["findings"], json!([]));
     let nonterminal = repo.review(
         3,
         &repo.stub(verdicts(&[anchor.clone(), clean("display.py")]), false),
@@ -346,19 +356,14 @@ fn review_distinguishes_typed_completion_and_preserves_verified_findings() {
     assert_eq!(nonterminal["findings"][0]["commit"], head);
     let positive = repo.review(
         2,
-        &repo.stub(
-            verdicts(&[
-                finding("delivery.py", "head", 99, "    return 'live'"),
-                finding("display.py", "base", 1, "return label"),
-            ]),
-            true,
-        ),
+        &repo.stub(verdicts(&[anchor, finding("display.py", "a4")]), true),
         &[],
     );
     assert_eq!(positive["status"], "findings");
     assert_eq!(positive["comparison"]["head"], head);
     assert_eq!(positive["findings"][0]["line"], 2);
-    assert_eq!(positive["findings"][0]["claimed_line"], 99);
+    assert_eq!(positive["findings"][0]["excerpt"], "    return 'live'");
+    assert!(positive["findings"][0]["claimed_line"].is_null());
     assert_eq!(positive["findings"][0]["id"], missing["findings"][0]["id"]);
     assert_eq!(positive["findings"][1]["commit"], base);
     let saved = repo.cli_stdout(
@@ -572,6 +577,7 @@ fn operator_interrupt_stops_the_active_reviewer() {
     );
     let mut child = isolated_command(env!("CARGO_BIN_EXE_revkit"))
         .current_dir(repo.root())
+        .env("HOME", repo.root().join(".git"))
         .env("FIXTURE_MARKER", &marker)
         .args([
             "review",
@@ -630,6 +636,7 @@ fn review_harness_uses_the_same_relative_path_lookup_as_doctor() {
     let run = |args: &[&str]| {
         let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
             .current_dir(repo.root())
+            .env("HOME", repo.root().join(".git"))
             .env("PATH", ".git:/usr/bin:/bin")
             .args(args)
             .args([
@@ -691,7 +698,7 @@ fn rename_preserves_source_and_destination_policy() {
 }
 
 #[test]
-fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
+fn anchors_resolve_long_lines_and_distinguish_removed_from_context() {
     let repo = Repo::new();
     repo.git(&["config", "diff.suppressBlankEmpty", "true"]);
     repo.write("file.txt", "leading\n\nunchanged\nremoved\ntrailing\n");
@@ -704,9 +711,9 @@ fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
     );
     repo.checkpoint("head");
 
-    let mut combined = finding("file.txt", "head", 4, &long_line);
+    let mut combined = finding("file.txt", "a5");
     let entries = combined["findings"].as_array_mut().unwrap();
-    entries.push(finding("file.txt", "base", 4, "removed")["findings"][0].clone());
+    entries.push(finding("file.txt", "a4")["findings"][0].clone());
     let report = repo.review(2, &repo.stub(verdicts(&[combined]), true), &[]);
     assert_eq!(report["findings"].as_array().unwrap().len(), 2);
     assert!(
@@ -716,11 +723,141 @@ fn anchors_accept_long_changed_lines_but_reject_unchanged_base_context() {
             .iter()
             .any(|row| row["excerpt"] == long_line)
     );
-    let invalid = finding("file.txt", "base", 3, "unchanged");
-    let report = repo.review(3, &repo.stub(verdicts(&[invalid]), true), &[]);
-    assert_eq!(report["findings"], json!([]));
-    assert_eq!(report["leads"][0]["reason"], "invalid_anchor");
-    assert_eq!(report["coverage"]["file.txt"], "unsettled");
+    let context = finding("file.txt", "a3");
+    let report = repo.review(2, &repo.stub(verdicts(&[context]), true), &[]);
+    assert_eq!(report["findings"][0]["side"], "head");
+    assert_eq!(report["findings"][0]["line"], 3);
+    assert_eq!(report["findings"][0]["excerpt"], "unchanged");
+}
+
+#[test]
+fn annotated_anchors_are_deterministic_and_bound_to_visible_pinned_lines() {
+    let repo = Repo::new();
+    repo.write("a-deleted.txt", "deleted context\n");
+    repo.write("b.txt", "repeat\r\nold\r\nrepeat\r\nend");
+    repo.write(
+        "d-old.txt",
+        &format!(
+            "{}\n",
+            (1..=24)
+                .map(|n| format!("stable line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    let base = repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    fs::remove_file(repo.root().join("a-deleted.txt")).unwrap();
+    repo.write("b.txt", "repeat\r\nnew\r\nrepeat\r\nend!");
+    repo.write("c.txt", "a1 + literal source\n");
+    repo.git(&["mv", "d-old.txt", "d-new.txt"]);
+    let renamed = fs::read_to_string(repo.root().join("d-new.txt")).unwrap();
+    repo.write(
+        "d-new.txt",
+        &renamed
+            .replace("stable line 2\n", "changed first\n")
+            .replace("stable line 23\n", "changed last\n"),
+    );
+    let head = repo.checkpoint("head");
+    let capture = repo.root().join(".git/captured-prompt");
+    let stub = repo.stub(
+        verdicts(&[clean("b.txt"), clean("c.txt"), clean("d-new.txt")]),
+        true,
+    );
+    let runner = repo.runner(
+        "capture-reviewer",
+        &format!(
+            "for prompt do :; done\nprintf '%s' \"$prompt\" > '{}'\nexec '{}' \"$@\"",
+            capture.display(),
+            stub.display()
+        ),
+    );
+    repo.review(0, &runner, &[]);
+    let first = fs::read_to_string(&capture).unwrap();
+    repo.review(0, &runner, &[]);
+    assert_eq!(first, fs::read_to_string(&capture).unwrap());
+    let projection: Value = serde_json::from_str(first.lines().last().unwrap()).unwrap();
+    let patches = projection["patches"].as_array().unwrap();
+    let patch = |path: &str| {
+        patches.iter().find(|row| row["path"] == path).unwrap()["patch"]
+            .as_str()
+            .unwrap()
+    };
+    assert!(!patch("a-deleted.txt").contains("a1 "));
+    let b = patch("b.txt");
+    assert!(b.contains("a1  repeat\r\n"));
+    assert!(b.contains("a2 -old\r\n"));
+    assert!(b.contains("a3 +new\r\n"));
+    assert!(b.contains("a4  repeat\r\n"));
+    assert!(b.contains("a5 -end\n\\ No newline at end of file\n"));
+    assert!(b.contains("a6 +end!\n\\ No newline at end of file\n"));
+    assert!(patch("c.txt").contains("a7 +a1 + literal source\n"));
+    let anchor = |path: &str, source: &str| {
+        patch(path)
+            .lines()
+            .find_map(|row| {
+                let (id, text) = row.split_once(' ')?;
+                (id.starts_with('a') && text == source).then_some(id)
+            })
+            .unwrap()
+    };
+    let mut b_findings = finding("b.txt", "a1");
+    b_findings["findings"]
+        .as_array_mut()
+        .unwrap()
+        .extend(["a4", "a5", "a6"].map(|id| finding("b.txt", id)["findings"][0].clone()));
+    let mut d_findings = finding("d-new.txt", anchor("d-new.txt", "-stable line 23"));
+    d_findings["findings"]
+        .as_array_mut()
+        .unwrap()
+        .push(finding("d-new.txt", anchor("d-new.txt", "+changed last"))["findings"][0].clone());
+    let report = repo.review(
+        2,
+        &repo.stub(
+            verdicts(&[b_findings, finding("c.txt", "a7"), d_findings]),
+            true,
+        ),
+        &[],
+    );
+    let rows = report["findings"].as_array().unwrap();
+    assert_eq!(rows.len(), 7);
+    for (path, side, commit, line, excerpt) in [
+        ("b.txt", "head", &head, 1, "repeat"),
+        ("b.txt", "head", &head, 3, "repeat"),
+        ("b.txt", "base", &base, 4, "end"),
+        ("b.txt", "head", &head, 4, "end!"),
+        ("c.txt", "head", &head, 1, "a1 + literal source"),
+        ("d-old.txt", "base", &base, 23, "stable line 23"),
+        ("d-new.txt", "head", &head, 23, "changed last"),
+    ] {
+        assert!(
+            rows.iter().any(|row| {
+                row["path"] == path
+                    && row["side"] == side
+                    && row["commit"] == commit.as_str()
+                    && row["line"] == line
+                    && row["excerpt"] == excerpt
+            }),
+            "{path}:{line} {side}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn admission_counts_anchor_prefixes_in_prompt_budget() {
+    let repo = Repo::new();
+    repo.write("base.txt", "base\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("large.txt", &format!("{}\n", "x".repeat(31)).repeat(1300));
+    repo.checkpoint("head");
+    let plan = repo.cli(0, &["plan", "--base", "main", "--format", "json"]);
+    assert_eq!(plan["admission"]["status"], "over_limit");
+    assert_eq!(plan["admission"]["reasons"], json!(["prompt_byte_limit"]));
+    let harness = repo.runner("must-not-run", "exit 99");
+    let report = repo.review(3, &harness, &[]);
+    assert_eq!(report["coverage"]["large.txt"], "unsettled");
+    assert_eq!(report["reasons"], json!(["prompt_byte_limit"]));
 }
 
 #[test]
@@ -732,7 +869,7 @@ fn duplicate_findings_keep_the_strongest_severity() {
     repo.write("file.txt", "after\n");
     repo.checkpoint("head");
 
-    let mut advisory = finding("file.txt", "head", 1, "after");
+    let mut advisory = finding("file.txt", "a2");
     advisory["findings"][0]["severity"] = json!("P3");
     let report = repo.review(0, &repo.stub(verdicts(&[advisory.clone()]), true), &[]);
     let id = &report["findings"][0]["id"];
@@ -759,7 +896,7 @@ fn saved_review_can_be_recovered_when_latest_cannot_be_replaced() {
     fs::create_dir_all(repo.root().join(".git/revkit/latest")).unwrap();
     let report = repo.review(
         1,
-        &repo.stub(verdicts(&[finding("file.txt", "head", 1, "after")]), true),
+        &repo.stub(verdicts(&[finding("file.txt", "a2")]), true),
         &[],
     );
     let message = report["error"]["message"].as_str().unwrap();
@@ -855,4 +992,251 @@ fn inherited_git_location_and_diff_options_cannot_override_a_plan() {
     assert_eq!(plan["comparison"]["head"], head);
     assert_eq!(plan["unit"], json!(["right.txt"]));
     assert_eq!(plan["admission"]["status"], "admitted");
+}
+
+#[test]
+fn metrics_count_attempts_and_deduplicate_only_explicit_prs() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let stub = repo.stub(verdicts(&[clean("file.txt")]), true);
+    let unavailable = repo.root().join(".git/unavailable");
+    let identity = "forge.invalid/private/example#42";
+    let args = ["--pr-id", identity, "--harness-version", "fixture-v1"];
+    repo.review(0, &stub, &args);
+    repo.review(0, &stub, &args);
+    repo.review(6, &unavailable, &[]);
+    let summary = repo.cli(0, &["metrics", "show", "--format", "json"]);
+    assert_eq!(summary["attempts"], 3);
+    assert_eq!(summary["distinct_attributed_prs"], 1);
+    assert_eq!(summary["unattributed_attempts"], 1);
+    assert_eq!(summary["outcomes"]["unavailable"], 1);
+    assert_eq!(summary["coverage"]["settled_paths"], 2);
+    assert_eq!(summary["usage"]["input"]["reported_sum"], 840);
+    assert_eq!(summary["usage"]["input"]["unknown_attempts"], 1);
+    assert!(summary["reported_cost"].is_null());
+    let dir = repo.root().join(".git/.revkit/metrics");
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let mut pr_digests = Vec::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let file = entry.unwrap().path();
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        if file.extension().is_some_and(|ext| ext == "json") {
+            let text = fs::read_to_string(file).unwrap();
+            assert!(!text.contains(identity));
+            assert!(!text.contains("file.txt"));
+            let row: Value = serde_json::from_str(&text).unwrap();
+            if let Some(digest) = row["pr_digest"].as_str() {
+                pr_digests.push(digest.to_owned());
+                assert_eq!(row["observed_provider"], "fixture-observed");
+                assert_eq!(row["harness_version"], "fixture-v1");
+                assert_eq!(row["selected_model"], "fixture/model");
+            }
+        }
+    }
+    assert_eq!(pr_digests.len(), 2);
+    assert_eq!(pr_digests[0], pr_digests[1]);
+    fs::write(dir.join("unrelated"), "keep").unwrap();
+    let cleared = repo.cli(0, &["metrics", "clear", "--format", "json"]);
+    assert_eq!(cleared["removed_attempts"], 3);
+    assert_eq!(
+        repo.cli(0, &["metrics", "show", "--format", "json"])["attempts"],
+        0
+    );
+    assert!(!dir.join("pr-key").exists());
+    assert!(dir.join("unrelated").exists());
+}
+
+#[test]
+fn metrics_opt_out_and_repository_store_are_isolated() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.write(".gitignore", "/.revkit/metrics/\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let stub = repo.stub(verdicts(&[clean("file.txt")]), true);
+    let global = repo.root().join(".git/.revkit/metrics");
+    let local = repo.root().join(".revkit/metrics");
+    repo.review(0, &stub, &["--no-metrics"]);
+    assert!(!global.exists());
+    repo.cli_stdout(
+        1,
+        &[
+            "review",
+            "--base",
+            "main",
+            "--trusted-local",
+            "--pr-id",
+            "",
+            "--harness",
+            stub.to_str().unwrap(),
+            "--model",
+            "fixture/model",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!global.exists());
+    repo.write(".git/.revkit/settings.toml", "[metrics]\nenabled = false\n");
+    repo.write(".revkit/settings.toml", "[metrics]\nenabled = true\n");
+    repo.review(0, &stub, &["--metrics-store", "repository"]);
+    assert!(!local.exists());
+    repo.write(".git/.revkit/settings.toml", "[metrics]\nenabled = true\n");
+    repo.write(".revkit/settings.toml", "[metrics]\nenabled = false\n");
+    repo.review(0, &stub, &[]);
+    assert!(!global.exists());
+    repo.write(".revkit/settings.toml", "[metrics]\nenabled = true\n");
+    let settings_dir = repo.root().join(".revkit");
+    fs::set_permissions(&settings_dir, fs::Permissions::from_mode(0o775)).unwrap();
+    repo.review(0, &stub, &[]);
+    assert_eq!(
+        repo.cli(0, &["metrics", "show", "--format", "json"])["attempts"],
+        1
+    );
+    repo.cli(0, &["metrics", "clear", "--format", "json"]);
+    fs::remove_dir_all(&global).unwrap();
+    fs::set_permissions(&settings_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    repo.review(0, &stub, &["--metrics-store", "repository"]);
+    assert_eq!(
+        repo.cli(
+            0,
+            &[
+                "metrics",
+                "show",
+                "--store",
+                "repository",
+                "--format",
+                "json"
+            ]
+        )["attempts"],
+        1
+    );
+    assert!(!global.exists());
+    repo.git(&["add", "-f", ".revkit/metrics/lock"]);
+    repo.review(0, &stub, &["--metrics-store", "repository"]);
+    repo.cli(
+        1,
+        &[
+            "metrics",
+            "show",
+            "--store",
+            "repository",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!global.exists());
+}
+
+#[test]
+fn metrics_refuse_symlink_and_do_not_change_verdict() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let stub = repo.stub(verdicts(&[clean("file.txt")]), true);
+    let outside = tempfile::tempdir().unwrap();
+    let parent = repo.root().join(".git/.revkit");
+    fs::create_dir(&parent).unwrap();
+    symlink(outside.path(), parent.join("metrics")).unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_revkit"))
+        .current_dir(repo.root())
+        .env("HOME", repo.root().join(".git"))
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--trusted-local",
+            "--harness",
+            stub.to_str().unwrap(),
+            "--model",
+            "fixture/model",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local metrics not recorded"));
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    repo.cli(1, &["metrics", "clear", "--format", "json"]);
+    assert!(parent.join("metrics").is_symlink());
+}
+
+#[test]
+fn metrics_retention_excludes_expired_and_bounds_new_attempts() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let stub = repo.stub(verdicts(&[clean("file.txt")]), true);
+    repo.review(0, &stub, &[]);
+    let dir = repo.root().join(".git/.revkit/metrics");
+    let original = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let mut old: Value = serde_json::from_slice(&fs::read(&original).unwrap()).unwrap();
+    let today = old["utc_day"].as_u64().unwrap();
+    old["utc_day"] = json!(today - 90);
+    fs::write(&original, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(
+        repo.cli(0, &["metrics", "show", "--format", "json"])["attempts"],
+        0
+    );
+    repo.review(0, &stub, &[]);
+    assert!(!original.exists());
+    let fresh = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    for index in 0..999 {
+        fs::copy(&fresh, dir.join(format!("attempt-{index:016}.json"))).unwrap();
+    }
+    repo.review(0, &stub, &[]);
+    assert_eq!(
+        repo.cli(0, &["metrics", "show", "--format", "json"])["attempts"],
+        1000
+    );
+}
+
+#[test]
+fn metrics_preserve_large_reported_sums_without_panicking() {
+    let repo = Repo::new();
+    repo.write("file.txt", "before\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write("file.txt", "after\n");
+    repo.checkpoint("head");
+    let events = json!({"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":u64::MAX},"content":[{"type":"text","text":verdicts(&[clean("file.txt")]).to_string()}]}});
+    let stub = repo.runner(
+        "huge-usage",
+        &format!(
+            "cat <<'EVENTS'\n{events}\n{{\"type\":\"agent_end\",\"isTerminal\":true}}\nEVENTS"
+        ),
+    );
+    repo.review(0, &stub, &[]);
+    repo.review(0, &stub, &[]);
+    let summary = repo.cli(0, &["metrics", "show", "--format", "json"]);
+    assert_eq!(
+        summary["usage"]["input"]["reported_sum"],
+        (2 * u128::from(u64::MAX)).to_string()
+    );
 }

@@ -13,6 +13,7 @@ pub(crate) struct Execution {
     pub(crate) status: Status,
     pub(crate) final_text: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
     pub(crate) usage: Option<serde_json::Value>,
     pub(crate) reason: Option<String>,
 }
@@ -23,6 +24,7 @@ impl Execution {
             status: Status::Unavailable,
             final_text: None,
             model: None,
+            provider: None,
             usage: None,
             reason: Some(reason.to_owned()),
         }
@@ -110,6 +112,7 @@ pub(crate) fn interrupted() -> bool {
 struct Transcript {
     final_text: Option<String>,
     model: Option<String>,
+    provider: Option<String>,
     usage: Option<serde_json::Value>,
     stopped: bool,
     provider_error_status: Option<u64>,
@@ -191,6 +194,11 @@ impl Transcript {
         {
             self.model = Some(model.to_owned());
         }
+        if let Some(provider) = message.get("provider").and_then(serde_json::Value::as_str)
+            && !provider.is_empty()
+        {
+            self.provider = Some(provider.to_owned());
+        }
         if let Some(usage) = message.get("usage").and_then(serde_json::Value::as_object) {
             let mut tokens = serde_json::Map::new();
             for key in [
@@ -210,6 +218,9 @@ impl Transcript {
                 "completion_tokens",
                 "cache_read_input_tokens",
                 "cache_creation_input_tokens",
+                "reasoning",
+                "reasoningTokens",
+                "reasoning_tokens",
             ] {
                 if let Some(value) = usage.get(key)
                     && value.is_number()
@@ -283,6 +294,7 @@ impl Transcript {
             },
             final_text: self.final_text,
             model: self.model,
+            provider: self.provider,
             usage: self.usage,
             reason,
         }

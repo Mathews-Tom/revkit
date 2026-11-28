@@ -49,6 +49,8 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
+The unreleased reviewer protocol annotates selectable diff lines with request-scoped identifiers such as `a12`. Each returned finding supplies `anchor_id`, `severity`, and `note`; Revkit resolves its path, revision, blob, line, and excerpt from pinned source. Added and context lines resolve on the head; removed lines resolve on the base. Deleted-file context has no selectable identifiers. Unknown or cross-file identifiers leave the assigned path unsettled, not clean. An anchored finding is not proof of the underlying defect. Custom reviewer harnesses must use this new response contract; saved report coordinates remain unchanged (`claimed_line` is null for new findings).
+
 Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. JSON output includes the saved `coverage` map and `reasons` array, even when filtering by finding ID. The published 0.1.0 and 0.1.1 builds omit coverage and reasons from this lookup. A successful lookup does not mean the saved review completed; check its status. The lookup does not run the model or checks.
 
 The unreleased build reports a numeric upstream HTTP error status when OMP supplies one on the failed assistant response. It does not copy OMP's raw error message. A process deadline is reported as a timeout, not an inferred provider error.
@@ -63,6 +65,23 @@ The unreleased build reports a numeric upstream HTTP error status when OMP suppl
 | `6` | Reviewer unavailable |
 
 Reports show all applicable reasons. Incomplete or unavailable review takes precedence over check and finding exit codes; failing checks take precedence over findings. Tests use a scripted reviewer and need no provider account.
+
+## Local metrics (unreleased)
+
+Source builds record review attempts locally by default in `~/.revkit/metrics/`. No metrics are uploaded. Use `revkit metrics show --format json` to inspect counts and `revkit metrics clear` to remove the records and PR attribution key. Records use owner-only files, retain at most 1,000 attempts, and expire after 90 days on the next recorded attempt. Expired attempts are excluded from inspection.
+
+To select a repository-local store, first ignore `/.revkit/metrics/` in Git, then pass `--metrics-store repository` to `review` and `--store repository` to `metrics show` or `metrics clear`. Revkit refuses tracked or non-ignored repository stores. Each review writes to at most one store.
+
+Disable collection per review with `--no-metrics`, or persist the opt-out in `~/.revkit/settings.toml` or `<repo>/.revkit/settings.toml`:
+
+```toml
+[metrics]
+enabled = false
+```
+
+Either opt-out wins. Pass `--pr-id forge.example/org/repository#123` only when the PR identity is known; repeated attempts are counted separately but attributed PRs are deduplicated within the chosen store using a private keyed digest. Without an explicit ID, the attempt remains unattributed. No branch inference or forge request is made. `--harness-version` records an operator-known version without launching another executable. Raw paths, review inputs, findings, and PR identities are not collected. Local metrics failures warn separately and never cause a model retry or change the review verdict.
+
+Counters retain original harness field names and reported-attempt denominators; absent usage/cost is unknown, not zero. Aggregate sums exceeding the JSON unsigned 64-bit integer range are exact decimal strings. Anchored counts represent comments, not adjudicated bugs. Do not compare model quality or cost across unmatched changes from these records.
 
 Maintainers: see [release instructions](https://github.com/Mathews-Tom/revkit/blob/main/docs/releasing.md).
 
