@@ -4,10 +4,10 @@ Rust CLI for pre-push review of committed changes. The initial supported target 
 
 ## Quickstart
 
-Install the published 0.1.1 crate with Git and a current stable Rust toolchain, or build from a source checkout with `cargo install --locked --path /path/to/revkit`. Review requires an already-configured `omp`; `plan` does not require `omp` or make a model call.
+Install revkit 0.2.0 from crates.io with Git and a current stable Rust toolchain, or build from a source checkout with `cargo install --locked --path /path/to/revkit`. Review requires an already-configured `omp`; `plan` does not require `omp` or make a model call.
 
 ```sh
-cargo install --locked revkit --version '=0.1.1'
+cargo install --locked revkit --version '=0.2.0'
 revkit --version
 revkit init
 revkit doctor
@@ -45,15 +45,15 @@ Optional `[checks]` entries map names to shell commands. `plan` shows their iden
 
 ## Results
 
-`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. With released Revkit 0.1.1, select `--format json` on the review command itself to inspect the returned `usage` object. The unreleased source build also displays reported counters in the default text review output. Keep the reported field names (including `cacheRead` and `cacheWrite` when present); do not sum an existing `totalTokens` counter with its components. Missing counters are unknown, not zero. These counters do not establish billed usage or subscription quota consumption, and comparing different changes does not isolate harness overhead.
+`plan` measures the bytes in Revkit’s review request before OMP adds its own context. This is not a model token budget. Review displays harness-reported token counters in the default text output and in its JSON `usage` object. Keep the reported field names (including `cacheRead` and `cacheWrite` when present); do not sum an existing `totalTokens` counter with its components. Missing counters are unknown, not zero. These counters do not establish billed usage or subscription quota consumption, and comparing different changes does not isolate harness overhead.
 
 Use `--format json` for versioned structured output, or `--format sarif` with `review` or `findings`. Saved reports are local to the worktree's Git directory. `findings [ID]` and `rules explain PATH` read the latest report or `--run ID` without a reviewer. Base-side anchors must point to removed lines and are not exported as current-head inline locations. Unanchored leads remain local.
 
-The unreleased reviewer protocol annotates selectable diff lines with request-scoped identifiers such as `a12`. Each returned finding supplies `anchor_id`, `severity`, and `note`; Revkit resolves its path, revision, blob, line, and excerpt from pinned source. Added and context lines resolve on the head; removed lines resolve on the base. Deleted-file context has no selectable identifiers. Unknown or cross-file identifiers leave the assigned path unsettled, not clean. Assigned files with no selectable source anchor (for example, a mode-only change) also remain unsettled. An anchored finding is not proof of the underlying defect. Custom reviewer harnesses must use this new response contract; saved report coordinates remain unchanged (`claimed_line` is null for new findings).
+The 0.2 reviewer protocol annotates selectable diff lines with request-scoped identifiers such as `a12`. Each returned finding supplies `anchor_id`, `severity`, and `note`; Revkit resolves its path, revision, blob, line, and excerpt from pinned source. Added and context lines resolve on the head; removed lines resolve on the base. Deleted-file context has no selectable identifiers. Unknown or cross-file identifiers leave the assigned path unsettled, not clean. Assigned files with no selectable source anchor (for example, a mode-only change) also remain unsettled. An anchored finding is not proof of the underlying defect. Custom reviewer harnesses must migrate to this response contract; saved report coordinates remain unchanged (`claimed_line` is null for new findings).
 
-Build from the current source checkout to see the saved head, per-file coverage, and reasons alongside anchored findings in `revkit findings --run ID`. JSON output includes the saved `coverage` map and `reasons` array, even when filtering by finding ID. The published 0.1.0 and 0.1.1 builds omit coverage and reasons from this lookup. A successful lookup does not mean the saved review completed; check its status. The lookup does not run the model or checks.
+`revkit findings --run ID` shows the saved head, per-file coverage, and reasons alongside anchored findings. JSON output includes the saved `coverage` map and `reasons` array, even when filtering by finding ID. The 0.1.0 and 0.1.1 builds omit coverage and reasons from this lookup. A successful lookup does not mean the saved review completed; check its status. The lookup does not run the model or checks.
 
-The unreleased build reports a numeric upstream HTTP error status when OMP supplies one on the failed assistant response. It does not copy OMP's raw error message. A process deadline is reported as a timeout, not an inferred provider error.
+Revkit reports a numeric upstream HTTP error status when OMP supplies one on the failed assistant response. It does not copy OMP's raw error message. A process deadline is reported as a timeout, not an inferred provider error.
 
 | Exit | Meaning |
 |---|---|
@@ -66,9 +66,9 @@ The unreleased build reports a numeric upstream HTTP error status when OMP suppl
 
 Reports show all applicable reasons. Incomplete or unavailable review takes precedence over check and finding exit codes; failing checks take precedence over findings. Tests use a scripted reviewer and need no provider account.
 
-## Local metrics (unreleased)
+## Local metrics
 
-Source builds record review attempts locally by default in `~/.revkit/metrics/`. No metrics are uploaded. Use `revkit metrics show --format json` to inspect counts and `revkit metrics clear` to remove the records and PR attribution key. Records use owner-only files, retain at most 1,000 attempts, and expire after 90 days on the next recorded attempt. Expired attempts are excluded from inspection.
+Revkit records review attempts locally by default in `~/.revkit/metrics/`. No metrics are uploaded. Use `revkit metrics show --format json` to inspect counts and `revkit metrics clear` to remove the records and PR attribution key. Records use owner-only files, retain at most 1,000 attempts, and expire after 90 days on the next recorded attempt. Expired attempts are excluded from inspection.
 
 To select a repository-local store, first ignore `/.revkit/metrics/` in Git, then pass `--metrics-store repository` to `review` and `--store repository` to `metrics show` or `metrics clear`. Revkit refuses tracked or non-ignored repository stores. Each review writes to at most one store.
 
