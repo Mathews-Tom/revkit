@@ -760,21 +760,19 @@ fn annotated_anchors_are_deterministic_and_bound_to_visible_pinned_lines() {
     );
     let head = repo.checkpoint("head");
     let capture = repo.root().join(".git/captured-prompt");
-    let stub = repo.stub(
+    repo.stub(
         verdicts(&[clean("b.txt"), clean("c.txt"), clean("d-new.txt")]),
         true,
     );
     let runner = repo.runner(
         "capture-reviewer",
-        &format!(
-            "for prompt do :; done\nprintf '%s' \"$prompt\" > '{}'\nexec '{}' \"$@\"",
-            capture.display(),
-            stub.display()
-        ),
+        "dir=$(dirname -- \"$0\")\nfor prompt do :; done\nprintf '%s' \"$prompt\" > \"$dir/captured-prompt\"\nexec \"$dir/offline-reviewer\" \"$@\"",
     );
     repo.review(0, &runner, &[]);
     let first = fs::read_to_string(&capture).unwrap();
+    repo.git(&["config", "diff.interHunkContext", "100"]);
     repo.review(0, &runner, &[]);
+    repo.git(&["config", "--unset", "diff.interHunkContext"]);
     assert_eq!(first, fs::read_to_string(&capture).unwrap());
     let projection: Value = serde_json::from_str(first.lines().last().unwrap()).unwrap();
     let patches = projection["patches"].as_array().unwrap();
@@ -1046,6 +1044,11 @@ fn metrics_count_attempts_and_deduplicate_only_explicit_prs() {
     assert_eq!(pr_digests.len(), 2);
     assert_eq!(pr_digests[0], pr_digests[1]);
     fs::write(dir.join("unrelated"), "keep").unwrap();
+    for name in ["attempt-0123456789abcdef", "key-stage-0123456789abcdef"] {
+        let path = dir.join(name);
+        fs::write(&path, "abandoned").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let cleared = repo.cli(0, &["metrics", "clear", "--format", "json"]);
     assert_eq!(cleared["removed_attempts"], 3);
     assert_eq!(
@@ -1054,6 +1057,8 @@ fn metrics_count_attempts_and_deduplicate_only_explicit_prs() {
     );
     assert!(!dir.join("pr-key").exists());
     assert!(dir.join("unrelated").exists());
+    assert!(!dir.join("attempt-0123456789abcdef").exists());
+    assert!(!dir.join("key-stage-0123456789abcdef").exists());
 }
 
 #[test]
@@ -1238,5 +1243,45 @@ fn metrics_preserve_large_reported_sums_without_panicking() {
     assert_eq!(
         summary["usage"]["input"]["reported_sum"],
         (2 * u128::from(u64::MAX)).to_string()
+    );
+}
+
+#[test]
+fn metadata_only_change_cannot_settle_without_an_anchor() {
+    let repo = Repo::new();
+    repo.write("file.txt", "unchanged content\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    fs::set_permissions(
+        repo.root().join("file.txt"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    repo.checkpoint("executable bit");
+    let report = repo.review(3, &repo.stub(verdicts(&[clean("file.txt")]), true), &[]);
+    assert_eq!(report["coverage"]["file.txt"], "unsettled");
+    assert!(report["reasons"].as_array().unwrap().iter().any(|reason| {
+        reason
+            .as_str()
+            .unwrap()
+            .contains("No selectable source anchor")
+    }));
+}
+
+#[test]
+fn admission_reports_both_limits_when_one_patch_exceeds_both() {
+    let repo = Repo::new();
+    repo.write("base.txt", "base\n");
+    repo.checkpoint("base");
+    repo.git(&["checkout", "-qb", "change"]);
+    repo.write(
+        "big.txt",
+        &"a very long line of new content with multiple words\n".repeat(1600),
+    );
+    repo.checkpoint("large change");
+    let plan = repo.cli(0, &["plan", "--base", "main", "--format", "json"]);
+    assert_eq!(
+        plan["admission"]["reasons"],
+        json!(["changed_line_limit", "prompt_byte_limit"])
     );
 }

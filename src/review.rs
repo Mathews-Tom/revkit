@@ -390,6 +390,12 @@ fn validate(
         else {
             continue;
         };
+        let has_anchor = anchors.iter().any(|anchor| anchor.file_index == file_index);
+        if !has_anchor {
+            result
+                .reasons
+                .push(format!("No selectable source anchor: {path:?}"));
+        }
         let rows = by_path.remove(path).unwrap_or_default();
         let mut bad = invalid.contains(path);
         if rows.is_empty() && !bad {
@@ -494,7 +500,7 @@ fn validate(
             result
                 .reasons
                 .push(format!("Invalid verdict or anchor: {path:?}"));
-        } else if completed {
+        } else if completed && has_anchor {
             result.coverage.insert(
                 path.to_owned(),
                 if saw_finding {

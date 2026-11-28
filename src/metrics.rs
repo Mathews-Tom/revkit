@@ -224,6 +224,7 @@ pub(crate) fn record(
     let mut attempt = attempt(options, exit_code, model, report, elapsed_ms)?;
     let dir = directory(options.metrics_store, Some(git))?;
     let store = Store::open(dir, true)?.ok_or("Metrics store was not created")?;
+    store.remove_staging()?;
     if let Some(identity) = &options.pr_id {
         attempt.pr_digest = Some(keyed_digest(&store.key()?, identity.as_bytes()));
     }
@@ -370,7 +371,16 @@ impl Store {
         if !metadata.is_file() || !owner_private(&metadata) {
             return Err("Metrics lock must be a regular owner-only file".into());
         }
-        lock.lock()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
         Ok(Some(Self { dir, _lock: lock }))
     }
 
@@ -389,7 +399,10 @@ impl Store {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let mut key = [0; 32];
                 fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-                let mut temp = tempfile::NamedTempFile::new_in(&self.dir)?;
+                let mut temp = tempfile::Builder::new()
+                    .prefix("key-stage-")
+                    .rand_bytes(16)
+                    .tempfile_in(&self.dir)?;
                 temp.write_all(&key)?;
                 temp.as_file().sync_all()?;
                 temp.persist_noclobber(path)?;
@@ -397,6 +410,24 @@ impl Store {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    // Called with the store lock held; any recognized staging file is abandoned.
+    fn remove_staging(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("attempt-")
+                    .or_else(|| name.strip_prefix("key-stage-"))
+                    .is_some_and(|id| {
+                        id.len() == 16 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+                    })
+            }) {
+                private_file(&entry.path())?;
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     fn record_paths(&self) -> Result<Vec<PathBuf>> {
@@ -518,6 +549,7 @@ pub(crate) fn clear(location: Location, git: Option<&Git>) -> Result<Value> {
     let Some(store) = Store::open(directory(location, git)?, false)? else {
         return Ok(json!({"kind":"metrics_clear","schema_version":1,"removed_attempts":0}));
     };
+    store.remove_staging()?;
     let records = store.record_paths()?;
     for path in &records {
         fs::remove_file(path)?;

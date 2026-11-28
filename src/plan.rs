@@ -226,6 +226,10 @@ pub(crate) fn prepare(git: &Git, comparison: Comparison, requirements: &str) -> 
             let patch = git.patch(file)?;
             let raw_len = patch.len();
             if raw_bytes + raw_len > MAX_PROMPT_BYTES {
+                let (changed, _) = annotate_patch(&patch, None, &mut anchors)?;
+                if lines + changed > MAX_CHANGED_LINES {
+                    admission.reasons.push("changed_line_limit");
+                }
                 admission.reasons.push("prompt_byte_limit");
                 break;
             }

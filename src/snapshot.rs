@@ -452,6 +452,7 @@ impl Git {
                     "--no-indent-heuristic",
                     "--text",
                     "--unified=3",
+                    "--inter-hunk-context=0",
                     old,
                     new,
                     "--",
