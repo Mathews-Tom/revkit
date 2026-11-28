@@ -398,6 +398,28 @@ impl Git {
         &self.cwd
     }
 
+    pub(crate) fn require_ignored_untracked(&self, path: &str) -> Result<()> {
+        if !self.bytes(&["ls-files", "--", path])?.is_empty() {
+            return Err("Repository metrics store contains tracked files".into());
+        }
+        let directory = format!("{path}/");
+        // check-ignore rejects Git's literal pathspec magic; this path is a fixed
+        // internal store name, not a user-controlled pathspec.
+        let output = self
+            .command(&[
+                "--no-literal-pathspecs",
+                "check-ignore",
+                "-q",
+                "--",
+                &directory,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err("Repository metrics store must be explicitly Git-ignored".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn git_dir(&self) -> Result<PathBuf> {
         let path = self.text(&["rev-parse", "--absolute-git-dir"])?;
         Ok(PathBuf::from(
@@ -430,6 +452,7 @@ impl Git {
                     "--no-indent-heuristic",
                     "--text",
                     "--unified=3",
+                    "--inter-hunk-context=0",
                     old,
                     new,
                     "--",

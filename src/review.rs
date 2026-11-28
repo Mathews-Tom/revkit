@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use crate::harness::{self, Execution, Status};
-use crate::plan::{MAX_FINDINGS_PER_FILE, MAX_PROMPT_BYTES, Plan, Prepared, digest};
+use crate::plan::{Anchor, MAX_FINDINGS_PER_FILE, Plan, Prepared, Side, digest};
 use crate::policy::Rule;
 use crate::snapshot::{Comparison, Git, Selection};
 use crate::{Result, SCHEMA_VERSION};
@@ -33,7 +33,11 @@ pub(crate) struct Report {
     pub(crate) effective_rules: BTreeMap<String, Vec<String>>,
     pub(crate) rules: Vec<Rule>,
     pub(crate) exclusions: Value,
-    model: Option<String>,
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    #[serde(skip)]
+    pub(crate) no_changes: bool,
     pub(crate) usage: Option<Value>,
     elapsed_ms: u128,
 }
@@ -93,22 +97,6 @@ pub(crate) struct Check {
     pub(crate) reason: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Side {
-    Head,
-    Base,
-}
-
-impl Side {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Head => "head",
-            Self::Base => "base",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum Severity {
     P0,
@@ -153,10 +141,8 @@ enum Decision {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Candidate {
-    side: Side,
-    line: usize,
+    anchor_id: String,
     severity: Severity,
-    excerpt: String,
     note: String,
 }
 
@@ -226,7 +212,7 @@ pub(crate) fn run(
         plan,
         policy,
         prompt,
-        removed_lines,
+        anchors,
     } = prepared;
     let checks = if run_checks {
         checks(git, &plan, &policy)
@@ -250,6 +236,7 @@ pub(crate) fn run(
     let mut findings = Vec::new();
     let mut leads = Vec::new();
     let mut observed_model = None;
+    let mut observed_provider = None;
     let mut usage = None;
     let status = match (plan.admission.status, prompt) {
         ("no_changes", _) => RunStatus::Clean,
@@ -261,12 +248,13 @@ pub(crate) fn run(
         }
         ("admitted", Some(prompt)) => {
             let execution = harness::run(executable, model, &prompt, timeout);
-            let validation = validate(git, &plan, &removed_lines, &execution)?;
+            let validation = validate(git, &plan, &anchors, &execution)?;
             coverage = validation.coverage;
             findings = validation.findings;
             leads = validation.leads;
             reasons.extend(validation.reasons);
             observed_model = execution.model;
+            observed_provider = execution.provider;
             usage = execution.usage;
             if execution.status == Status::Unavailable {
                 RunStatus::Unavailable
@@ -317,6 +305,8 @@ pub(crate) fn run(
         rules: plan.rules,
         exclusions,
         model: observed_model,
+        provider: observed_provider,
+        no_changes: plan.admission.status == "no_changes",
         usage,
         elapsed_ms: start.elapsed().as_millis(),
     })
@@ -332,7 +322,7 @@ struct Validation {
 fn validate(
     git: &Git,
     plan: &Plan,
-    removed_lines: &BTreeMap<String, Vec<usize>>,
+    anchors: &[Anchor],
     execution: &Execution,
 ) -> Result<Validation> {
     let mut result = Validation {
@@ -392,7 +382,7 @@ fn validate(
         }
     }
     let mut by_id = BTreeMap::<String, usize>::new();
-    for file in &plan.files {
+    for (file_index, file) in plan.files.iter().enumerate() {
         let Some(path) = file
             .path
             .as_deref()
@@ -400,6 +390,12 @@ fn validate(
         else {
             continue;
         };
+        let has_anchor = anchors.iter().any(|anchor| anchor.file_index == file_index);
+        if !has_anchor {
+            result
+                .reasons
+                .push(format!("No selectable source anchor: {path:?}"));
+        }
         let rows = by_path.remove(path).unwrap_or_default();
         let mut bad = invalid.contains(path);
         if rows.is_empty() && !bad {
@@ -424,76 +420,79 @@ fn validate(
                     bad = true;
                     continue;
                 };
-                if candidate.line == 0
-                    || candidate.note.trim().is_empty()
-                    || candidate.note.len() > 2_048
-                    || candidate.excerpt.len() > MAX_PROMPT_BYTES
-                    || candidate.excerpt.contains('\n')
-                {
+                if candidate.note.trim().is_empty() || candidate.note.len() > 2_048 {
                     bad = true;
                     continue;
                 }
-                let (commit, blob, index) = match candidate.side {
-                    Side::Head => (Some(&plan.comparison.head), file.new_blob.as_ref(), 0),
-                    Side::Base => (plan.comparison.base.as_ref(), file.old_blob.as_ref(), 1),
+                let anchor = candidate
+                    .anchor_id
+                    .strip_prefix('a')
+                    .filter(|index| {
+                        !index.starts_with('0') && index.bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| anchors.get(index));
+                let reason = match anchor {
+                    None => Some("unknown_anchor_id"),
+                    Some(anchor) if anchor.file_index != file_index => Some("anchor_path_mismatch"),
+                    Some(_) => None,
                 };
-                let anchor = if let (Some(commit), Some(blob)) = (commit, blob) {
-                    if blobs[index].is_none() {
-                        blobs[index] = Some(git.blob_text(blob)?);
-                    }
-                    let content = blobs[index].as_deref().expect("loaded blob");
-                    locate(content, candidate.line, &candidate.excerpt)
-                        .filter(|line| {
-                            candidate.side == Side::Head
-                                || removed_lines
-                                    .get(path)
-                                    .is_some_and(|removed| removed.binary_search(line).is_ok())
-                        })
-                        .map(|line| (commit, blob, line))
-                } else {
-                    None
-                };
-                if let Some((commit, blob, line)) = anchor {
-                    let anchor_path = match candidate.side {
-                        Side::Head => path,
-                        Side::Base => file.old_path.as_deref().unwrap_or(path),
-                    };
-                    let id = digest(&serde_json::to_vec(&(
-                        anchor_path,
-                        candidate.side,
-                        commit,
-                        line,
-                        &candidate.excerpt,
-                        &candidate.note,
-                    ))?);
-                    if let Some(&index) = by_id.get(&id) {
-                        let finding = &mut result.findings[index];
-                        finding.severity = finding.severity.min(candidate.severity);
-                        if line == candidate.line {
-                            finding.claimed_line = None;
-                        }
-                    } else {
-                        by_id.insert(id.clone(), result.findings.len());
-                        result.findings.push(Finding {
-                            id,
-                            path: anchor_path.to_owned(),
-                            side: candidate.side,
-                            commit: commit.clone(),
-                            blob: blob.clone(),
-                            line,
-                            claimed_line: (line != candidate.line).then_some(candidate.line),
-                            severity: candidate.severity,
-                            excerpt: candidate.excerpt,
-                            note: candidate.note,
-                        });
-                    }
-                } else {
+                if let Some(reason) = reason {
                     result.leads.push(Lead {
                         path: path.to_owned(),
                         note: candidate.note,
-                        reason: "invalid_anchor".to_owned(),
+                        reason: reason.to_owned(),
                     });
                     bad = true;
+                    continue;
+                }
+                let anchor = anchor.expect("validated anchor");
+                let (commit, blob, index, anchor_path) = match anchor.side {
+                    Side::Head => (Some(&plan.comparison.head), file.new_blob.as_ref(), 0, path),
+                    Side::Base => (
+                        plan.comparison.base.as_ref(),
+                        file.old_blob.as_ref(),
+                        1,
+                        file.old_path.as_deref().unwrap_or(path),
+                    ),
+                };
+                let commit = commit.ok_or("Anchor has no pinned commit")?;
+                let blob = blob.ok_or("Anchor has no pinned blob")?;
+                if blobs[index].is_none() {
+                    blobs[index] = Some(git.blob_text(blob)?);
+                }
+                let excerpt = blobs[index]
+                    .as_deref()
+                    .expect("loaded blob")
+                    .lines()
+                    .nth(anchor.line - 1)
+                    .ok_or("Anchor line is outside pinned blob")?;
+                let id = digest(&serde_json::to_vec(&(
+                    anchor_path,
+                    anchor.side,
+                    commit,
+                    anchor.line,
+                    excerpt,
+                    &candidate.note,
+                ))?);
+                if let Some(&index) = by_id.get(&id) {
+                    let finding = &mut result.findings[index];
+                    finding.severity = finding.severity.min(candidate.severity);
+                } else {
+                    by_id.insert(id.clone(), result.findings.len());
+                    result.findings.push(Finding {
+                        id,
+                        path: anchor_path.to_owned(),
+                        side: anchor.side,
+                        commit: commit.clone(),
+                        blob: blob.clone(),
+                        line: anchor.line,
+                        claimed_line: None,
+                        severity: candidate.severity,
+                        excerpt: excerpt.to_owned(),
+                        note: candidate.note,
+                    });
                 }
             }
         }
@@ -501,7 +500,7 @@ fn validate(
             result
                 .reasons
                 .push(format!("Invalid verdict or anchor: {path:?}"));
-        } else if completed {
+        } else if completed && has_anchor {
             result.coverage.insert(
                 path.to_owned(),
                 if saw_finding {
@@ -519,21 +518,6 @@ fn validate(
         (a.severity, &a.path, a.line, &a.id).cmp(&(b.severity, &b.path, b.line, &b.id))
     });
     Ok(result)
-}
-
-fn locate(blob: &str, claimed: usize, excerpt: &str) -> Option<usize> {
-    if blob.lines().nth(claimed - 1) == Some(excerpt) {
-        return Some(claimed);
-    }
-    if excerpt.trim().is_empty() {
-        return None;
-    }
-    let mut matches = blob
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| *line == excerpt);
-    let (line, _) = matches.next()?;
-    matches.next().is_none().then_some(line + 1)
 }
 
 fn pending_check(plan: &crate::plan::CheckPlan, status: &str) -> Check {
